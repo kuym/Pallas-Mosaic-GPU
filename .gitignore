@@ -2,3 +2,7 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+farm/
+farm.log
+cpu_tests.log
+.venv-gpu/
