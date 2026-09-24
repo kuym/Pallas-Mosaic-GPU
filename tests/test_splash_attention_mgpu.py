@@ -333,3 +333,117 @@ def test_interpret_lazy_rescaling(growth):
                              atol=2e-2, rtol=2e-2)
   np.testing.assert_allclose(np.asarray(lse), np.asarray(ref_lse), rtol=1e-3,
                              atol=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# Backward pass (dQ and dK/dV kernels)
+# ---------------------------------------------------------------------------
+
+
+def _check_grads(
+    mask_name, *, s=512, b=None, h=2, kvh=None, d=64, mqa=False,
+    segments=False, cap=None, block_sizes=sa.BlockSizes(), interpret=None,
+    multi_head_mask=False,
+):
+  kvh = kvh or h
+  if multi_head_mask:
+    names = list(_masks(s))
+    heads = [_masks(s)[names[(names.index(mask_name) + i) % len(names)]]
+             for i in range(h)]
+    mask = sa.MultiHeadMask(heads)
+    dense = np.stack([np.asarray(m[:, :]) for m in heads])
+  else:
+    mask = _masks(s)[mask_name]
+    dense = np.asarray(mask[:, :])[None]
+  make = sa.make_splash_mqa if mqa else sa.make_splash_mha
+  kernel = make(mask, block_sizes=block_sizes, attn_logits_soft_cap=cap,
+                interpret=interpret)
+  device = jax.devices("cpu")[0] if interpret is not None else None
+  with jax.default_device(device):
+    q, k, v = _inputs(b, h, kvh, s, d, d, jnp.bfloat16, mqa)
+    w = jax.random.normal(jax.random.key(7), q.shape, jnp.float32)
+    seg = None
+    if segments:
+      ids = jnp.asarray(np.repeat(np.arange(4), s // 4), jnp.int32)
+      seg = sa.SegmentIds(ids, ids)
+
+    def loss(f):
+      return lambda q, k, v: jnp.sum(f(q, k, v).astype(jnp.float32) * w)
+
+    grad = lambda f: jax.grad(loss(f), argnums=(0, 1, 2))
+    if interpret is not None:
+      _reset_interpreter()
+      with pretend_arch():
+        got = grad(lambda q, k, v: kernel(q, k, v, seg))(q, k, v)
+      assert not interpret_pallas_call.get_races().races_found
+    else:
+      got = grad(lambda q, k, v: kernel(q, k, v, seg))(q, k, v)
+    want = grad(lambda q, k, v: sa.attention_reference(
+        jnp.asarray(dense), q, k, v, seg, is_mqa=mqa,
+        attn_logits_soft_cap=cap))(q, k, v)
+  for name, g, r in zip("qkv", got, want):
+    g, r = np.asarray(g, np.float32), np.asarray(r, np.float32)
+    rel = np.abs(g - r).max() / np.abs(r).max()
+    assert rel < 2e-2, f"d{name}: relative error {rel}"
+
+
+GRAD_CASES = [
+    dict(mask_name="full"),
+    dict(mask_name="causal"),
+    dict(mask_name="local", segments=True),
+    dict(mask_name="chunked"),
+    dict(mask_name="dense"),
+    dict(mask_name="dense", segments=True),
+    dict(mask_name="causal", cap=5.0),
+    dict(mask_name="causal", h=4, kvh=2),
+    dict(mask_name="causal", mqa=True, h=3),
+    dict(mask_name="causal", b=2),
+    dict(mask_name="causal", d=128),
+    dict(mask_name="causal", multi_head_mask=True, h=3),
+    dict(mask_name="causal",
+         block_sizes=sa.BlockSizes(block_kv_dq=128, block_q_dkv=32,
+                                   num_stages_bwd=1)),
+    dict(mask_name="dense",
+         block_sizes=sa.BlockSizes(block_kv_dq=32, block_q_dkv=128,
+                                   num_stages_bwd=3)),
+]
+_case_id = lambda kw: ",".join(f"{k}={v}" for k, v in kw.items())
+
+
+@pytest.mark.parametrize("kwargs", GRAD_CASES, ids=_case_id)
+def test_interpret_grads(kwargs):
+  kwargs = dict(kwargs)
+  _check_grads(kwargs.pop("mask_name"), interpret=INTERPRET, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [dict(), dict(segments=True, mask_name="dense", d=128),
+     dict(mask_name="local", cap=30.0, mqa=True)],
+    ids=lambda kw: _case_id(kw) or "default",
+)
+def test_grads_lower_for_sm100(kwargs):
+  kwargs = dict(kwargs)
+  mask = _masks(512)[kwargs.pop("mask_name", "causal")]
+  mqa = kwargs.get("mqa", False)
+  kernel = (sa.make_splash_mqa if mqa else sa.make_splash_mha)(
+      mask, attn_logits_soft_cap=kwargs.get("cap"))
+  d = kwargs.get("d", 64)
+  q, k, v = jax.eval_shape(
+      lambda: _inputs(None, 4, 2, 512, d, d, jnp.bfloat16, mqa))
+  seg = None
+  if kwargs.get("segments"):
+    ids = jax.ShapeDtypeStruct((512,), jnp.int32)
+    seg = sa.SegmentIds(ids, ids)
+  f = jax.grad(
+      lambda q, k, v, seg: kernel(q, k, v, seg).astype(jnp.float32).sum(),
+      argnums=(0, 1, 2))
+  text = lower_for_blackwell(f, q, k, v, seg)
+  assert text.count("mosaic_gpu") >= 3  # forward, dQ and dK/dV kernels
+
+
+@needs_blackwell
+@pytest.mark.parametrize("kwargs", GRAD_CASES, ids=_case_id)
+def test_gpu_grads(kwargs):
+  kwargs = dict(kwargs)
+  _check_grads(kwargs.pop("mask_name"), s=2048, **kwargs)

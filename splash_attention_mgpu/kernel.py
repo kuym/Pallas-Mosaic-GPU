@@ -69,9 +69,22 @@ class SegmentIds(NamedTuple):
 
 @dataclasses.dataclass(frozen=True)
 class BlockSizes:
+  """Tiling of the forward and backward kernels.
+
+  block_q / block_kv: granularity of the sparse schedule (and of the forward
+    kernel's tiles).
+  num_stages: depth of the forward kernel's K/V SMEM ring.
+  block_kv_dq: KV rows per step of the dQ kernel (a divisor of block_kv).
+  block_q_dkv: q rows per step of the dK/dV kernel (a divisor of block_q).
+  num_stages_bwd: depth of the backward kernels' SMEM rings.
+  """
+
   block_q: int = BLOCK_Q
   block_kv: int = 128
   num_stages: int = 2
+  block_kv_dq: int = 64
+  block_q_dkv: int = 64
+  num_stages_bwd: int = 2
 
   def __post_init__(self):
     if self.block_q != BLOCK_Q:
@@ -83,6 +96,12 @@ class BlockSizes:
       # QK of step s+1 is issued before PV of step s, so the K/V ring must
       # hold two steps or the pipeline deadlocks.
       raise ValueError(f"num_stages must be >= 2, got {self.num_stages}")
+    if self.block_kv_dq not in (32, 64, 128) or self.block_kv % self.block_kv_dq:
+      raise ValueError(f"block_kv_dq={self.block_kv_dq} must divide block_kv")
+    if self.block_q_dkv not in (32, 64, 128):
+      raise ValueError(f"block_q_dkv must be 32, 64 or 128")
+    if self.num_stages_bwd < 1:
+      raise ValueError("num_stages_bwd must be >= 1")
 
 
 def _where(pred, x, y):
@@ -411,7 +430,11 @@ def _splash_attention_forward(
         o = plgpu.async_load_tmem(o_tmem)
         plgpu.wait_load_tmem()
         o = o * lax.broadcast_in_dim(1.0 / l_i, o.shape, [0])
-        lse = (m_i + jnp.log2(l_i)) * LN2
+        # Rows whose logits are all masked keep m == mask_value; report
+        # lse == mask_value for them, as the TPU kernel does (in f32,
+        # mask_value + log(count) == mask_value).
+        lse = _where(m_i == mask_value, mask_value,
+                     (m_i + jnp.log2(l_i)) * LN2)
         return o.astype(dtype), lse
 
       def empty_output():

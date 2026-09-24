@@ -11,8 +11,9 @@ either).
 
 from __future__ import annotations
 
+import dataclasses
 import functools
-from typing import Any
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -21,13 +22,19 @@ from jax.experimental.pallas.ops.tpu.splash_attention import (
     splash_attention_mask as mask_lib,
 )
 
+from . import backward as backward_lib
 from . import kernel as kernel_lib
 from . import mask_info as mask_info_lib
 from .kernel import DEFAULT_MASK_VALUE, BlockSizes, SegmentIds
 
 
 class SplashAttentionKernel:
-  """Callable holding the processed mask. Forward pass only."""
+  """Callable holding the processed mask.
+
+  Differentiable with respect to q, k and v (dQ and dK/dV Mosaic GPU kernels,
+  as in the TPU module).  With `save_residuals=True` the logsumexp is also
+  returned, and that variant is forward-only.
+  """
 
   def __init__(
       self,
@@ -41,16 +48,30 @@ class SplashAttentionKernel:
   ):
     self.info = info
     self.is_mqa = is_mqa
-    self.block_sizes = block_sizes
-    self.mask_value = mask_value
-    self.attn_logits_soft_cap = attn_logits_soft_cap
-    self.interpret = interpret
+    self.static = _Static(
+        mask_function=info.mask_function,
+        block_sizes=block_sizes,
+        mask_value=mask_value,
+        attn_logits_soft_cap=attn_logits_soft_cap,
+        interpret=interpret,
+    )
     to_dev = lambda x: None if x is None else jnp.asarray(x)
-    self._num_steps = to_dev(info.num_steps)
-    self._kv_block = to_dev(info.kv_block)
-    self._block_kind = to_dev(info.block_kind)
-    self._mask_block = to_dev(info.mask_block)
-    self._partial_mask_blocks = to_dev(info.partial_mask_blocks)
+    self.schedule = _Schedule(
+        num_steps=to_dev(info.num_steps),
+        kv_block=to_dev(info.kv_block),
+        block_kind=to_dev(info.block_kind),
+        mask_block=to_dev(info.mask_block),
+        partial_mask_blocks=to_dev(info.partial_mask_blocks),
+        dkv_num_steps=to_dev(info.dkv_num_steps),
+        dkv_q_block=to_dev(info.dkv_q_block),
+        dkv_block_kind=to_dev(info.dkv_block_kind),
+        dkv_mask_block=to_dev(info.dkv_mask_block),
+        partial_mask_blocks_t=to_dev(info.partial_mask_blocks_t),
+    )
+
+  @property
+  def block_sizes(self) -> BlockSizes:
+    return self.static.block_sizes
 
   def __call__(
       self,
@@ -62,30 +83,38 @@ class SplashAttentionKernel:
       save_residuals: bool = False,
   ):
     return _splash_attention(
-        q, k, v, segment_ids,
-        self._num_steps, self._kv_block, self._block_kind, self._mask_block,
-        self._partial_mask_blocks,
-        is_mqa=self.is_mqa,
-        mask_function=self.info.mask_function,
-        block_sizes=self.block_sizes,
-        mask_value=self.mask_value,
-        attn_logits_soft_cap=self.attn_logits_soft_cap,
-        save_residuals=save_residuals,
-        interpret=self.interpret,
+        q, k, v, segment_ids, self.schedule,
+        is_mqa=self.is_mqa, static=self.static, save_residuals=save_residuals,
     )
 
 
+@dataclasses.dataclass(frozen=True)
+class _Static:
+  mask_function: Any
+  block_sizes: BlockSizes
+  mask_value: float
+  attn_logits_soft_cap: float | None
+  interpret: Any
+
+
+class _Schedule(NamedTuple):
+  num_steps: jax.Array
+  kv_block: jax.Array
+  block_kind: jax.Array
+  mask_block: jax.Array | None
+  partial_mask_blocks: jax.Array | None
+  dkv_num_steps: jax.Array
+  dkv_q_block: jax.Array
+  dkv_block_kind: jax.Array
+  dkv_mask_block: jax.Array | None
+  partial_mask_blocks_t: jax.Array | None
+
+
 @functools.partial(
-    jax.jit,
-    static_argnames=(
-        "is_mqa", "mask_function", "block_sizes", "mask_value",
-        "attn_logits_soft_cap", "save_residuals", "interpret",
-    ),
+    jax.jit, static_argnames=("is_mqa", "static", "save_residuals")
 )
 def _splash_attention(
-    q, k, v, segment_ids, num_steps, kv_block, block_kind, mask_block,
-    partial_mask_blocks, *, is_mqa, mask_function, block_sizes, mask_value,
-    attn_logits_soft_cap, save_residuals, interpret,
+    q, k, v, segment_ids, schedule, *, is_mqa, static, save_residuals
 ):
   batched = q.ndim == 4
   if not batched:
@@ -103,24 +132,72 @@ def _splash_attention(
     if seg_kv.ndim == 1:
       seg_kv = jnp.broadcast_to(seg_kv, (q.shape[0], seg_kv.shape[0]))
     segment_ids = SegmentIds(seg_q.astype(jnp.int32), seg_kv.astype(jnp.int32))
-  result = kernel_lib._splash_attention_forward(
-      q, k, v, segment_ids, num_steps, kv_block, block_kind, mask_block,
-      partial_mask_blocks,
-      mask_function=mask_function,
-      block_sizes=block_sizes,
-      mask_value=mask_value,
-      attn_logits_soft_cap=attn_logits_soft_cap,
-      save_residuals=save_residuals,
-      interpret=interpret,
-  )
   if save_residuals:
-    out, lse = result
+    out, lse = _forward(static, q, k, v, segment_ids, schedule,
+                        save_residuals=True)
   else:
-    out, lse = result, None
+    out, lse = _attention(static, q, k, v, segment_ids, schedule), None
   if not batched:
     out = out[0]
     lse = None if lse is None else lse[0]
   return (out, (lse,)) if save_residuals else out
+
+
+def _forward(static, q, k, v, segment_ids, schedule, *, save_residuals):
+  return kernel_lib._splash_attention_forward(
+      q, k, v, segment_ids,
+      schedule.num_steps, schedule.kv_block, schedule.block_kind,
+      schedule.mask_block, schedule.partial_mask_blocks,
+      mask_function=static.mask_function,
+      block_sizes=static.block_sizes,
+      mask_value=static.mask_value,
+      attn_logits_soft_cap=static.attn_logits_soft_cap,
+      save_residuals=save_residuals,
+      interpret=static.interpret,
+  )
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(0,))
+def _attention(static, q, k, v, segment_ids, schedule):
+  return _forward(static, q, k, v, segment_ids, schedule,
+                  save_residuals=False)
+
+
+def _attention_fwd(static, q, k, v, segment_ids, schedule):
+  out, lse = _forward(static, q, k, v, segment_ids, schedule,
+                      save_residuals=True)
+  return out, (q, k, v, segment_ids, schedule, out, lse)
+
+
+def _attention_bwd(static, residuals, do):
+  q, k, v, segment_ids, schedule, out, lse = residuals
+  bs = static.block_sizes
+  delta = jnp.sum(do.astype(jnp.float32) * out.astype(jnp.float32), axis=-1)
+  do = do.astype(q.dtype)
+  common = dict(
+      mask_function=static.mask_function,
+      block_kv=bs.block_kv,
+      num_stages=bs.num_stages_bwd,
+      mask_value=static.mask_value,
+      attn_logits_soft_cap=static.attn_logits_soft_cap,
+      interpret=static.interpret,
+  )
+  dq = backward_lib.splash_attention_bwd_dq(
+      q, k, v, do, lse, delta, segment_ids,
+      schedule.num_steps, schedule.kv_block, schedule.block_kind,
+      schedule.mask_block, schedule.partial_mask_blocks,
+      block_kv_compute=bs.block_kv_dq, **common,
+  )
+  dk, dv = backward_lib.splash_attention_bwd_dkv(
+      q, k, v, do, lse, delta, segment_ids,
+      schedule.dkv_num_steps, schedule.dkv_q_block, schedule.dkv_block_kind,
+      schedule.dkv_mask_block, schedule.partial_mask_blocks_t,
+      block_q_compute=bs.block_q_dkv, **common,
+  )
+  return dq, dk, dv, None, None
+
+
+_attention.defvjp(_attention_fwd, _attention_bwd)
 
 
 def _make_splash_attention(

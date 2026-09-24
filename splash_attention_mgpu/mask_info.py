@@ -12,6 +12,9 @@ must be visited:
   block_kind[h, i, s]   PARTIAL (needs masking) or FULL (every entry visible)
   mask_block[h, i, s]   index into `partial_mask_blocks` (dense masks only)
 
+The dK/dV backward kernel owns a KV block instead, so the same information is
+also kept column-wise (`dkv_*`, the transposed schedule).
+
 We reuse the upstream TPU mask library (`splash_attention_mask`) and its block
 classification (`process_mask`) so that masks behave identically on both
 backends.
@@ -57,6 +60,13 @@ class GpuMaskInfo:
   block_q: int
   block_kv: int
   num_kv_blocks: int
+  # Transposed schedule for the dK/dV kernel, per (mask head, kv block).
+  dkv_num_steps: np.ndarray  # i32[mask_heads, kv_blocks]
+  dkv_q_block: np.ndarray  # i32[mask_heads, kv_blocks, max_dkv_steps]
+  dkv_block_kind: np.ndarray  # i32[mask_heads, kv_blocks, max_dkv_steps]
+  dkv_mask_block: np.ndarray | None  # i32[mask_heads, kv_blocks, max_dkv_steps]
+  # int8[num_partial_blocks, block_kv, block_q]: transposed partial blocks.
+  partial_mask_blocks_t: np.ndarray | None
 
   @property
   def max_steps(self) -> int:
@@ -88,43 +98,63 @@ def process_mask(
   )
   mask_heads, q_blocks, kv_blocks = block_mask.shape
 
-  num_steps = (block_mask != EMPTY).sum(axis=-1).astype(np.int32)
-  # Keep at least one (unused) column so every array has a non-empty shape.
-  max_steps = max(1, int(num_steps.max()))
-  kv_block = np.zeros((mask_heads, q_blocks, max_steps), np.int32)
-  block_kind = np.zeros((mask_heads, q_blocks, max_steps), np.int32)
-  mask_block = (
-      None
-      if mask_next is None
-      else np.zeros((mask_heads, q_blocks, max_steps), np.int32)
+  num_steps, kv_block, block_kind, mask_block = _compact_rows(
+      block_mask, mask_next
   )
-  for h in range(mask_heads):
-    for i in range(q_blocks):
-      (cols,) = np.nonzero(block_mask[h, i])
-      n = len(cols)
-      kv_block[h, i, :n] = cols
-      block_kind[h, i, :n] = block_mask[h, i, cols]
-      if mask_block is not None:
-        mask_block[h, i, :n] = mask_next[h, i, cols]
-      if n:
-        # Pad by repeating the last block; padding is never visited.
-        kv_block[h, i, n:] = cols[-1]
+  dkv_num_steps, dkv_q_block, dkv_block_kind, dkv_mask_block = _compact_rows(
+      block_mask.transpose(0, 2, 1),
+      None if mask_next is None else mask_next.transpose(0, 2, 1),
+  )
 
   partial_mask_blocks = None
   if mask_function is None and info.partial_mask_blocks is not None:
     partial_mask_blocks = np.asarray(info.partial_mask_blocks).astype(np.int8)
+    partial_mask_blocks_t = np.ascontiguousarray(
+        partial_mask_blocks.transpose(0, 2, 1)
+    )
+  else:
+    partial_mask_blocks_t = None
   if mask_function is None and partial_mask_blocks is None:
     # No partial blocks at all: nothing ever needs masking.
     assert not (block_kind == PARTIAL).any()
+  has_mask_blocks = partial_mask_blocks is not None
 
   return GpuMaskInfo(
       num_steps=num_steps,
       kv_block=kv_block,
       block_kind=block_kind,
-      mask_block=mask_block if partial_mask_blocks is not None else None,
+      mask_block=mask_block if has_mask_blocks else None,
       partial_mask_blocks=partial_mask_blocks,
       mask_function=mask_function,
       block_q=block_q,
       block_kv=block_kv,
       num_kv_blocks=kv_blocks,
+      dkv_num_steps=dkv_num_steps,
+      dkv_q_block=dkv_q_block,
+      dkv_block_kind=dkv_block_kind,
+      dkv_mask_block=dkv_mask_block if has_mask_blocks else None,
+      partial_mask_blocks_t=partial_mask_blocks_t,
   )
+
+
+def _compact_rows(block_mask: np.ndarray, mask_next: np.ndarray | None):
+  """Compacts each row of a [heads, rows, cols] block mask into a step list."""
+  heads, rows, _ = block_mask.shape
+  num_steps = (block_mask != EMPTY).sum(axis=-1).astype(np.int32)
+  # Keep at least one (unused) column so every array has a non-empty shape.
+  max_steps = max(1, int(num_steps.max()))
+  col = np.zeros((heads, rows, max_steps), np.int32)
+  kind = np.zeros((heads, rows, max_steps), np.int32)
+  mask_id = None if mask_next is None else np.zeros_like(col)
+  for h in range(heads):
+    for r in range(rows):
+      (cols,) = np.nonzero(block_mask[h, r])
+      n = len(cols)
+      col[h, r, :n] = cols
+      kind[h, r, :n] = block_mask[h, r, cols]
+      if mask_id is not None:
+        mask_id[h, r, :n] = mask_next[h, r, cols]
+      if n:
+        # Pad by repeating the last block; padding is never visited.
+        col[h, r, n:] = cols[-1]
+  return num_steps, col, kind, mask_id
