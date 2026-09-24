@@ -130,6 +130,7 @@ def _splash_attention_forward(
     v: jax.Array,  # [batch, num_kv_heads, kv_seq_len, head_dim_v]
     segment_ids: SegmentIds | None,  # i32[batch, seq] each
     num_steps: jax.Array,
+    q_block_order: jax.Array,
     kv_block: jax.Array,
     block_kind: jax.Array,
     mask_block: jax.Array | None,
@@ -206,8 +207,8 @@ def _splash_attention_forward(
     if has_segments:
       q_seg_gmem, kv_seg_gmem = refs[:2]
       del refs[:2]
-    num_steps_gmem, kv_block_gmem, block_kind_gmem = refs[:3]
-    del refs[:3]
+    num_steps_gmem, q_order_gmem, kv_block_gmem, block_kind_gmem = refs[:4]
+    del refs[:4]
     if has_dense_mask:
       mask_block_gmem, mask_blocks_gmem = refs[:2]
       del refs[:2]
@@ -223,11 +224,11 @@ def _splash_attention_forward(
 
     if reuse_q_smem:
       o_smem = q_smem
-    qi = lax.axis_index("q")
     h = lax.axis_index("h")
     b = lax.axis_index("b")
     wg = lax.axis_index("wg")
     mh = h if mask_heads > 1 else 0
+    qi = q_order_gmem[mh, lax.axis_index("q")]  # heaviest rows first
     kv_head = lax.div(h, q_heads_per_kv_head)
     n = num_steps_gmem[mh, qi]
     q_slice = pl.ds(qi * bq, bq)
@@ -508,7 +509,7 @@ def _splash_attention_forward(
   inputs = [q, k, v]
   if has_segments:
     inputs += [segment_ids.q, segment_ids.kv]
-  inputs += [num_steps, kv_block, block_kind]
+  inputs += [num_steps, q_block_order, kv_block, block_kind]
   if has_dense_mask:
     inputs += [mask_block, partial_mask_blocks]
 

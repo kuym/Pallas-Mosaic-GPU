@@ -58,11 +58,13 @@ class SplashAttentionKernel:
     to_dev = lambda x: None if x is None else jnp.asarray(x)
     self.schedule = _Schedule(
         num_steps=to_dev(info.num_steps),
+        q_block_order=to_dev(info.q_block_order),
         kv_block=to_dev(info.kv_block),
         block_kind=to_dev(info.block_kind),
         mask_block=to_dev(info.mask_block),
         partial_mask_blocks=to_dev(info.partial_mask_blocks),
         dkv_num_steps=to_dev(info.dkv_num_steps),
+        dkv_kv_block_order=to_dev(info.dkv_kv_block_order),
         dkv_q_block=to_dev(info.dkv_q_block),
         dkv_block_kind=to_dev(info.dkv_block_kind),
         dkv_mask_block=to_dev(info.dkv_mask_block),
@@ -99,11 +101,13 @@ class _Static:
 
 class _Schedule(NamedTuple):
   num_steps: jax.Array
+  q_block_order: jax.Array
   kv_block: jax.Array
   block_kind: jax.Array
   mask_block: jax.Array | None
   partial_mask_blocks: jax.Array | None
   dkv_num_steps: jax.Array
+  dkv_kv_block_order: jax.Array
   dkv_q_block: jax.Array
   dkv_block_kind: jax.Array
   dkv_mask_block: jax.Array | None
@@ -146,8 +150,8 @@ def _splash_attention(
 def _forward(static, q, k, v, segment_ids, schedule, *, save_residuals):
   return kernel_lib._splash_attention_forward(
       q, k, v, segment_ids,
-      schedule.num_steps, schedule.kv_block, schedule.block_kind,
-      schedule.mask_block, schedule.partial_mask_blocks,
+      schedule.num_steps, schedule.q_block_order, schedule.kv_block,
+      schedule.block_kind, schedule.mask_block, schedule.partial_mask_blocks,
       mask_function=static.mask_function,
       block_sizes=static.block_sizes,
       mask_value=static.mask_value,
@@ -184,13 +188,14 @@ def _attention_bwd(static, residuals, do):
   )
   dq = backward_lib.splash_attention_bwd_dq(
       q, k, v, do, lse, delta, segment_ids,
-      schedule.num_steps, schedule.kv_block, schedule.block_kind,
-      schedule.mask_block, schedule.partial_mask_blocks,
+      schedule.num_steps, schedule.q_block_order, schedule.kv_block,
+      schedule.block_kind, schedule.mask_block, schedule.partial_mask_blocks,
       block_kv_compute=bs.block_kv_dq, **common,
   )
   dk, dv = backward_lib.splash_attention_bwd_dkv(
       q, k, v, do, lse, delta, segment_ids,
-      schedule.dkv_num_steps, schedule.dkv_q_block, schedule.dkv_block_kind,
+      schedule.dkv_num_steps, schedule.dkv_kv_block_order,
+      schedule.dkv_q_block, schedule.dkv_block_kind,
       schedule.dkv_mask_block, schedule.partial_mask_blocks_t,
       block_q_compute=bs.block_q_dkv, **common,
   )

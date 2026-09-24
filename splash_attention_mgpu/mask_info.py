@@ -50,6 +50,9 @@ class GpuMaskInfo:
   """
 
   num_steps: np.ndarray  # i32[mask_heads, q_blocks]
+  # Launch order of the q blocks: heaviest rows first, so that uneven
+  # (e.g. causal) work does not end in a long tail.
+  q_block_order: np.ndarray  # i32[mask_heads, q_blocks]
   kv_block: np.ndarray  # i32[mask_heads, q_blocks, max_steps]
   block_kind: np.ndarray  # i32[mask_heads, q_blocks, max_steps]
   mask_block: np.ndarray | None  # i32[mask_heads, q_blocks, max_steps]
@@ -62,6 +65,7 @@ class GpuMaskInfo:
   num_kv_blocks: int
   # Transposed schedule for the dK/dV kernel, per (mask head, kv block).
   dkv_num_steps: np.ndarray  # i32[mask_heads, kv_blocks]
+  dkv_kv_block_order: np.ndarray  # i32[mask_heads, kv_blocks]
   dkv_q_block: np.ndarray  # i32[mask_heads, kv_blocks, max_dkv_steps]
   dkv_block_kind: np.ndarray  # i32[mask_heads, kv_blocks, max_dkv_steps]
   dkv_mask_block: np.ndarray | None  # i32[mask_heads, kv_blocks, max_dkv_steps]
@@ -119,8 +123,11 @@ def process_mask(
     assert not (block_kind == PARTIAL).any()
   has_mask_blocks = partial_mask_blocks is not None
 
+  heaviest_first = lambda steps: np.argsort(
+      -steps, axis=-1, kind="stable").astype(np.int32)
   return GpuMaskInfo(
       num_steps=num_steps,
+      q_block_order=heaviest_first(num_steps),
       kv_block=kv_block,
       block_kind=block_kind,
       mask_block=mask_block if has_mask_blocks else None,
@@ -130,6 +137,7 @@ def process_mask(
       block_kv=block_kv,
       num_kv_blocks=kv_blocks,
       dkv_num_steps=dkv_num_steps,
+      dkv_kv_block_order=heaviest_first(dkv_num_steps),
       dkv_q_block=dkv_q_block,
       dkv_block_kind=dkv_block_kind,
       dkv_mask_block=dkv_mask_block if has_mask_blocks else None,

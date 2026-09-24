@@ -154,6 +154,11 @@ def test_mask_info_reconstructs_mask(name, bkv):
         rebuilt[rows, cols] = np.asarray(info.mask_function(
             i * 128 + q_pos, j * bkv + kv_pos))
   np.testing.assert_array_equal(rebuilt, dense)
+  # Launch orders are permutations, heaviest rows / columns first.
+  for order, steps in ((info.q_block_order, info.num_steps),
+                       (info.dkv_kv_block_order, info.dkv_num_steps)):
+    np.testing.assert_array_equal(np.sort(order[0]), np.arange(len(order[0])))
+    assert np.all(np.diff(steps[0][order[0]]) <= 0)
 
 
 def test_mask_info_is_sparse():

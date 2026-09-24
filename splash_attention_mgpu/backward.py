@@ -84,7 +84,8 @@ def _probs_and_dlogits(
 def splash_attention_bwd_dq(
     q, k, v, do, lse, delta,
     segment_ids: SegmentIds | None,
-    num_steps, kv_block, block_kind, mask_block, partial_mask_blocks,
+    num_steps, q_block_order, kv_block, block_kind, mask_block,
+    partial_mask_blocks,
     *,
     mask_function,
     block_kv: int,
@@ -129,8 +130,8 @@ def splash_attention_bwd_dq(
     if has_segments:
       q_seg_gmem, kv_seg_gmem = refs[:2]
       del refs[:2]
-    num_steps_gmem, kv_block_gmem, block_kind_gmem = refs[:3]
-    del refs[:3]
+    num_steps_gmem, q_order_gmem, kv_block_gmem, block_kind_gmem = refs[:4]
+    del refs[:4]
     if has_dense_mask:
       mask_block_gmem, mask_blocks_gmem = refs[:2]
       del refs[:2]
@@ -143,11 +144,11 @@ def splash_attention_bwd_dq(
         kv_consumed, aux_consumed, s_ready, ds_ready, dq_done,
     ) = refs
 
-    qi = lax.axis_index("q")
     h = lax.axis_index("h")
     b = lax.axis_index("b")
     wg = lax.axis_index("wg")
     mh = h if mask_heads > 1 else 0
+    qi = q_order_gmem[mh, lax.axis_index("q")]  # heaviest rows first
     kv_head = lax.div(h, q_heads_per_kv_head)
     n = num_steps_gmem[mh, qi] * sub
     q_slice = pl.ds(qi * bq, bq)
@@ -335,7 +336,7 @@ def splash_attention_bwd_dq(
   inputs = [q, k, v, do, lse, delta]
   if has_segments:
     inputs += [segment_ids.q, segment_ids.kv]
-  inputs += [num_steps, kv_block, block_kind]
+  inputs += [num_steps, q_block_order, kv_block, block_kind]
   if has_dense_mask:
     inputs += [mask_block, partial_mask_blocks]
   return _launch(
@@ -349,7 +350,8 @@ def splash_attention_bwd_dq(
 def splash_attention_bwd_dkv(
     q, k, v, do, lse, delta,
     segment_ids: SegmentIds | None,
-    num_steps, q_block, block_kind, mask_block, partial_mask_blocks_t,
+    num_steps, kv_block_order, q_block, block_kind, mask_block,
+    partial_mask_blocks_t,
     *,
     mask_function,
     block_kv: int,
@@ -398,8 +400,8 @@ def splash_attention_bwd_dkv(
     if has_segments:
       q_seg_gmem, kv_seg_gmem = refs[:2]
       del refs[:2]
-    num_steps_gmem, q_block_gmem, block_kind_gmem = refs[:3]
-    del refs[:3]
+    num_steps_gmem, kv_order_gmem, q_block_gmem, block_kind_gmem = refs[:4]
+    del refs[:4]
     if has_dense_mask:
       mask_block_gmem, mask_blocks_gmem = refs[:2]
       del refs[:2]
@@ -413,8 +415,11 @@ def splash_attention_bwd_dkv(
         consumed, aux_consumed, s_ready, p_ready, done,
     ) = refs
 
-    kj = lax.axis_index("kv")
     hk = lax.axis_index("h")
+    # Heaviest KV blocks first.  With per-head masks the order of the group's
+    # first q head is used.
+    kj = kv_order_gmem[hk * group if mask_heads > 1 else 0,
+                       lax.axis_index("kv")]
     b = lax.axis_index("b")
     wg = lax.axis_index("wg")
     kv_slice = pl.ds(kj * bkv, bkv)
@@ -640,7 +645,7 @@ def splash_attention_bwd_dkv(
   inputs = [q, k, v, do, lse, delta]
   if has_segments:
     inputs += [segment_ids.q, segment_ids.kv]
-  inputs += [num_steps, q_block, block_kind]
+  inputs += [num_steps, kv_block_order, q_block, block_kind]
   if has_dense_mask:
     inputs += [mask_block, partial_mask_blocks_t]
   return _launch(
