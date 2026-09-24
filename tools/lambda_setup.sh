@@ -12,4 +12,4 @@ pip install -q "jax[cuda13]" pytest pytest-xdist absl-py
 python -c "import jax; print(jax.__version__, jax.devices())"
 # Native Blackwell tests (plus the CPU-interpreter and lowering tiers).
 PYTHONPATH=. python -m pytest tests -q -p no:cacheprovider
-PYTHONPATH=. python tools/bench.py
+PYTHONPATH=. python tools/bench.py --backward

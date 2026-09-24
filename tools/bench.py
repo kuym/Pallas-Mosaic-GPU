@@ -29,7 +29,8 @@ def _time(f, *args, iters=20):
   return statistics.median(runtimes_ms)
 
 
-def run(mask_name, seq, heads, kv_heads, head_dim, block_sizes, check=True):
+def run(mask_name, seq, heads, kv_heads, head_dim, block_sizes, check=True,
+        backward=False):
   masks = {
       "full": sa.FullMask((seq, seq)),
       "causal": sa.CausalMask((seq, seq)),
@@ -56,19 +57,30 @@ def run(mask_name, seq, heads, kv_heads, head_dim, block_sizes, check=True):
   else:
     err = float("nan")
 
-  ms = _time(kernel, q, k, v)
   info = kernel.info
   visible_blocks = float(info.num_steps.sum()) * (
       heads if info.num_steps.shape[0] == 1 else 1)
   flops = 4 * visible_blocks * info.block_q * info.block_kv * head_dim
   dense_flops = 4 * heads * seq * seq * head_dim
+  label = (f"{mask_name:>9} S={seq:<6} H={heads:<3} KVH={kv_heads:<3} "
+           f"D={head_dim:<4}")
+
+  ms = _time(kernel, q, k, v)
   print(
-      f"{mask_name:>9} S={seq:<6} H={heads:<3} KVH={kv_heads:<3} D={head_dim:<4}"
-      f" {block_sizes}: {ms * 1e3:8.1f} us  "
-      f"{flops / ms / 1e9:7.1f} TFLOP/s  "
+      f"fwd {label}: {ms * 1e3:8.1f} us  {flops / ms / 1e9:7.1f} TFLOP/s  "
       f"(dense-equiv {dense_flops / ms / 1e9:7.1f})  "
       f"density={info.density:.3f} err={err:.4f}"
   )
+  if backward:
+    grad = jax.jit(jax.grad(
+        lambda q, k, v: kernel(q, k, v).astype(jnp.float32).sum(),
+        argnums=(0, 1, 2)))
+    # Forward + backward: 2 + 5 matmuls of the visible blocks.
+    ms = _time(grad, q, k, v)
+    print(
+        f"f+b {label}: {ms * 1e3:8.1f} us  "
+        f"{flops * 3.5 / ms / 1e9:7.1f} TFLOP/s"
+    )
 
 
 def main():
@@ -82,6 +94,8 @@ def main():
   p.add_argument("--block-kv", type=int, nargs="*", default=[128])
   p.add_argument("--stages", type=int, nargs="*", default=[2])
   p.add_argument("--no-check", action="store_true")
+  p.add_argument("--backward", action="store_true",
+                 help="also time forward + backward")
   args = p.parse_args()
   print(jax.devices())
   for seq in args.seq:
@@ -92,7 +106,8 @@ def main():
             try:
               bs = sa.BlockSizes(block_kv=bkv, num_stages=stages)
               run(mask, seq, args.heads, args.kv_heads or args.heads, d, bs,
-                  check=not args.no_check and seq <= 8192)
+                  check=not args.no_check and seq <= 8192,
+                  backward=args.backward)
             except ValueError as e:
               print(f"skip {mask} S={seq} D={d} bkv={bkv} stages={stages}: {e}")
 

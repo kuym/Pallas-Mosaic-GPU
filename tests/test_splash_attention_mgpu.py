@@ -343,7 +343,7 @@ def test_interpret_lazy_rescaling(growth):
 def _check_grads(
     mask_name, *, s=512, b=None, h=2, kvh=None, d=64, mqa=False,
     segments=False, cap=None, block_sizes=sa.BlockSizes(), interpret=None,
-    multi_head_mask=False,
+    multi_head_mask=False, dtype=jnp.bfloat16,
 ):
   kvh = kvh or h
   if multi_head_mask:
@@ -360,7 +360,7 @@ def _check_grads(
                 interpret=interpret)
   device = jax.devices("cpu")[0] if interpret is not None else None
   with jax.default_device(device):
-    q, k, v = _inputs(b, h, kvh, s, d, d, jnp.bfloat16, mqa)
+    q, k, v = _inputs(b, h, kvh, s, d, d, dtype, mqa)
     w = jax.random.normal(jax.random.key(7), q.shape, jnp.float32)
     seg = None
     if segments:
@@ -399,6 +399,7 @@ GRAD_CASES = [
     dict(mask_name="causal", mqa=True, h=3),
     dict(mask_name="causal", b=2),
     dict(mask_name="causal", d=128),
+    dict(mask_name="causal", dtype=jnp.float16),
     dict(mask_name="causal", multi_head_mask=True, h=3),
     dict(mask_name="causal",
          block_sizes=sa.BlockSizes(block_kv_dq=128, block_q_dkv=32,
