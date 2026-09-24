@@ -36,6 +36,12 @@ def _on_blackwell() -> bool:
   return getattr(dev, "compute_capability", "").startswith("10.")
 
 
+def _reset_interpreter():
+  # Interpreter state is set up while tracing, so drop cached executables too.
+  jax.clear_caches()
+  interpret_pallas_call.gpu_callbacks.reset_gpu_interpret_mode_state()
+
+
 ON_BLACKWELL = _on_blackwell()
 needs_blackwell = pytest.mark.skipif(
     not ON_BLACKWELL, reason="needs a Blackwell (sm_100) GPU"
@@ -86,13 +92,22 @@ def _check(
       mask, block_sizes=block_sizes, attn_logits_soft_cap=cap,
       interpret=interpret,
   )
+  device = jax.devices("cpu")[0] if interpret is not None else None
+  with jax.default_device(device):
+    _check_on_device(kernel, dense, s=s, b=b, h=h, kvh=kvh, d=d, dv=dv,
+                     dtype=dtype, mqa=mqa, segments=segments, cap=cap,
+                     interpret=interpret)
+
+
+def _check_on_device(kernel, dense, *, s, b, h, kvh, d, dv, dtype, mqa,
+                     segments, cap, interpret):
   q, k, v = _inputs(b, h, kvh, s, d, dv, dtype, mqa)
   seg = None
   if segments:
     ids = jnp.asarray(np.repeat(np.arange(4), s // 4), jnp.int32)
     seg = sa.SegmentIds(ids, ids)
   if interpret is not None:
-    interpret_pallas_call.gpu_callbacks.reset_gpu_interpret_mode_state()
+    _reset_interpreter()
     with pretend_arch():
       out, (lse,) = kernel(q, k, v, seg, save_residuals=True)
     assert not interpret_pallas_call.get_races().races_found
@@ -191,8 +206,8 @@ def test_interpret_empty_rows_are_zero():
   dense[128:, :] = True
   kernel = sa.make_splash_mha(sa.NumpyMask(dense), interpret=INTERPRET)
   q, k, v = _inputs(None, 1, 1, s, 64, 64, jnp.bfloat16, False)
-  interpret_pallas_call.gpu_callbacks.reset_gpu_interpret_mode_state()
-  with pretend_arch():
+  _reset_interpreter()
+  with pretend_arch(), jax.default_device(jax.devices("cpu")[0]):
     out, (lse,) = kernel(q, k, v, save_residuals=True)
   assert not interpret_pallas_call.get_races().races_found
   np.testing.assert_array_equal(np.asarray(out[:, :128], np.float32), 0.0)
@@ -292,3 +307,29 @@ def test_gpu_masks(name, d):
 def test_gpu_features(kwargs):
   kwargs = dict(kwargs)
   _check(kwargs.pop("mask_name", "causal"), s=2048, **kwargs)
+
+
+@pytest.mark.parametrize("growth", [0.0, 0.05, 40.0])
+def test_interpret_lazy_rescaling(growth):
+  # Logit maxima that grow along the KV axis force O to be rescaled on later
+  # blocks (growth=40); tiny growth stays under the threshold and exercises
+  # the stale-max path; zero growth never rescales after the first block.
+  s, d = 1024, 64
+  kernel = sa.make_splash_mha(sa.CausalMask((s, s)), interpret=INTERPRET)
+  cpu = jax.devices("cpu")[0]
+  with jax.default_device(cpu):
+    q, k, v = _inputs(None, 2, 2, s, d, d, jnp.bfloat16, False)
+    pos = jnp.arange(s, dtype=jnp.float32)[None, :, None] / s
+    k = (k.astype(jnp.float32) * 0.3 + growth * pos).astype(jnp.bfloat16)
+    q = (jnp.abs(q.astype(jnp.float32)) * 0.3).astype(jnp.bfloat16)
+    _reset_interpreter()
+    with pretend_arch():
+      out, (lse,) = kernel(q, k, v, save_residuals=True)
+    assert not interpret_pallas_call.get_races().races_found
+    dense = jnp.asarray(np.tril(np.ones((s, s), bool)))[None]
+    ref, (ref_lse,) = sa.attention_reference(dense, q, k, v,
+                                             save_residuals=True)
+  np.testing.assert_allclose(np.asarray(out, np.float32), np.asarray(ref),
+                             atol=2e-2, rtol=2e-2)
+  np.testing.assert_allclose(np.asarray(lse), np.asarray(ref_lse), rtol=1e-3,
+                             atol=1e-3)

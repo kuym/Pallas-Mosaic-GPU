@@ -44,6 +44,9 @@ from . import mask_info as mask_info_lib
 DEFAULT_MASK_VALUE = -0.7 * float(np.finfo(np.dtype("float32")).max)
 LOG2E = math.log2(math.e)
 LN2 = math.log(2.0)
+# Rows only rescale their running max (and O) when it grows by more than this
+# many powers of two; see the softmax loop.
+RESCALE_THRESHOLD = 8.0
 
 # The softmax warpgroup handles 128 query rows, one TMEM lane per row.
 BLOCK_Q = 128
@@ -366,10 +369,18 @@ def _splash_attention_forward(
           plgpu.commit_smem()
           plgpu.barrier_arrive(aux_consumed.at[slot])
 
-        m_next = jnp.maximum(m_prev, qk.max(axis=1))
+        m_curr = jnp.maximum(m_prev, qk.max(axis=1))
+        # Lazy rescaling (as in FlashAttention-4): a row keeps its stale
+        # running max unless the new one exceeds it by more than
+        # RESCALE_THRESHOLD (log2 units).  P is then bounded by
+        # 2**RESCALE_THRESHOLD, and O only needs rescaling in TMEM when some
+        # row's max actually moved.
+        needs_rescale = m_curr - m_prev > RESCALE_THRESHOLD
+        m_next = _where(needs_rescale, m_curr, m_prev)
         alpha = jnp.exp2(m_prev - m_next)
         p = jnp.exp2(qk - lax.broadcast_in_dim(m_next, qk.shape, [0]))
         l_next = l_prev * alpha + p.sum(axis=1)
+        any_rescale = jnp.max(needs_rescale.astype(jnp.int32)) > 0
 
         # PV_{s-1} must be complete before we overwrite P and rescale O.
         @pl.when(s > 0)
@@ -378,7 +389,7 @@ def _splash_attention_forward(
 
         plgpu.async_store_tmem(p_tmem, p.astype(dtype))
 
-        @pl.when(s > 0)
+        @pl.when(jnp.logical_and(s > 0, any_rescale))
         def _rescale_o():
           o = plgpu.async_load_tmem(o_tmem)
           plgpu.wait_load_tmem()  # The load must finish before we overwrite.
