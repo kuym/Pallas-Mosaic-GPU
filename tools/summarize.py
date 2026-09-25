@@ -31,10 +31,10 @@ def main(path):
   print("best configurations (TFLOP/s over visible blocks):")
   for prob in sorted(best):
     for metric, (tf, bs, us) in sorted(best[prob].items()):
-      keys = (("block_kv", "num_stages") if metric == "fwd_tflops" else
+      keys = (("block_q", "block_kv", "num_stages") if metric == "fwd_tflops" else
               ("block_kv_dq", "block_q_dkv", "num_stages_bwd"))
       print(f"  {str(prob):42s} {metric:15s} {tf:7.1f} ({us:9.1f} us) "
-            + " ".join(f"{k}={bs[k]}" for k in keys))
+            + " ".join(f"{k}={bs.get(k, 128)}" for k in keys))
   if errors:
     print("\nbenchmark errors:")
     for e, n in errors.most_common(15):

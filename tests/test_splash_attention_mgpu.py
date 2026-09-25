@@ -455,3 +455,58 @@ def test_grads_lower_for_sm100(kwargs):
 def test_gpu_grads(kwargs):
   kwargs = dict(kwargs)
   _check_grads(kwargs.pop("mask_name"), s=2048, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Two-tile ping-pong forward kernel (block_q=256)
+# ---------------------------------------------------------------------------
+
+PINGPONG = sa.BlockSizes(block_q=256)
+PINGPONG_CASES = [
+    dict(mask_name="full"),
+    dict(mask_name="causal"),
+    dict(mask_name="local"),
+    dict(mask_name="chunked"),
+    dict(mask_name="dense", block_sizes=sa.BlockSizes(block_q=256, block_kv=64)),
+    dict(mask_name="causal", segments=True),
+    dict(mask_name="dense", segments=True,
+         block_sizes=sa.BlockSizes(block_q=256, block_kv=64)),
+    dict(mask_name="causal", cap=5.0),
+    dict(mask_name="causal", h=4, kvh=2),
+    dict(mask_name="full", mqa=True, b=2),
+    dict(mask_name="causal", d=128),
+    dict(mask_name="local", d=128, s=1024),
+    dict(mask_name="causal", multi_head_mask=True, h=3),
+    dict(mask_name="causal", dtype=jnp.float16),
+    dict(mask_name="causal", block_sizes=sa.BlockSizes(block_q=256, num_stages=3)),
+]
+
+
+@pytest.mark.parametrize("kwargs", PINGPONG_CASES, ids=_case_id)
+def test_interpret_pingpong(kwargs):
+  kwargs = dict(kwargs)
+  kwargs.setdefault("block_sizes", PINGPONG)
+  _check(kwargs.pop("mask_name"), interpret=INTERPRET, **kwargs)
+
+
+@pytest.mark.parametrize("kwargs", PINGPONG_CASES[:4], ids=_case_id)
+def test_interpret_pingpong_grads(kwargs):
+  kwargs = dict(kwargs)
+  kwargs.setdefault("block_sizes", PINGPONG)
+  _check_grads(kwargs.pop("mask_name"), interpret=INTERPRET, **kwargs)
+
+
+@needs_blackwell
+@pytest.mark.parametrize("kwargs", PINGPONG_CASES, ids=_case_id)
+def test_gpu_pingpong(kwargs):
+  kwargs = dict(kwargs)
+  kwargs.setdefault("block_sizes", PINGPONG)
+  _check(kwargs.pop("mask_name"), s=2048, **kwargs)
+
+
+@needs_blackwell
+@pytest.mark.parametrize("kwargs", PINGPONG_CASES[:4], ids=_case_id)
+def test_gpu_pingpong_grads(kwargs):
+  kwargs = dict(kwargs)
+  kwargs.setdefault("block_sizes", PINGPONG)
+  _check_grads(kwargs.pop("mask_name"), s=2048, **kwargs)

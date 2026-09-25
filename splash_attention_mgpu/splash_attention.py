@@ -23,6 +23,7 @@ from jax.experimental.pallas.ops.tpu.splash_attention import (
 )
 
 from . import backward as backward_lib
+from . import forward_pingpong
 from . import kernel as kernel_lib
 from . import mask_info as mask_info_lib
 from .kernel import DEFAULT_MASK_VALUE, BlockSizes, SegmentIds
@@ -40,13 +41,17 @@ class SplashAttentionKernel:
       self,
       info: mask_info_lib.GpuMaskInfo,
       *,
+      fwd_info: mask_info_lib.GpuMaskInfo | None = None,
       is_mqa: bool,
       block_sizes: BlockSizes,
       mask_value: float,
       attn_logits_soft_cap: float | None,
       interpret: Any,
   ):
+    # `info` has 128-row granularity (backward kernels, FLOP accounting);
+    # `fwd_info` matches block_sizes.block_q (the forward kernel).
     self.info = info
+    self.fwd_info = fwd_info = fwd_info or info
     self.is_mqa = is_mqa
     self.static = _Static(
         mask_function=info.mask_function,
@@ -57,6 +62,12 @@ class SplashAttentionKernel:
     )
     to_dev = lambda x: None if x is None else jnp.asarray(x)
     self.schedule = _Schedule(
+        fwd_num_steps=to_dev(fwd_info.num_steps),
+        fwd_q_block_order=to_dev(fwd_info.q_block_order),
+        fwd_kv_block=to_dev(fwd_info.kv_block),
+        fwd_block_kind=to_dev(fwd_info.block_kind),
+        fwd_mask_block=to_dev(fwd_info.mask_block),
+        fwd_partial_mask_blocks=to_dev(fwd_info.partial_mask_blocks),
         num_steps=to_dev(info.num_steps),
         q_block_order=to_dev(info.q_block_order),
         kv_block=to_dev(info.kv_block),
@@ -100,6 +111,12 @@ class _Static:
 
 
 class _Schedule(NamedTuple):
+  fwd_num_steps: jax.Array
+  fwd_q_block_order: jax.Array
+  fwd_kv_block: jax.Array
+  fwd_block_kind: jax.Array
+  fwd_mask_block: jax.Array | None
+  fwd_partial_mask_blocks: jax.Array | None
   num_steps: jax.Array
   q_block_order: jax.Array
   kv_block: jax.Array
@@ -148,10 +165,23 @@ def _splash_attention(
 
 
 def _forward(static, q, k, v, segment_ids, schedule, *, save_residuals):
+  bs = static.block_sizes
+  sched = (schedule.fwd_num_steps, schedule.fwd_q_block_order,
+           schedule.fwd_kv_block, schedule.fwd_block_kind,
+           schedule.fwd_mask_block, schedule.fwd_partial_mask_blocks)
+  if bs.block_q == forward_pingpong.CTA_ROWS:
+    return forward_pingpong.splash_attention_forward_pingpong(
+        q, k, v, segment_ids, *sched,
+        mask_function=static.mask_function,
+        block_kv=bs.block_kv,
+        num_stages=bs.num_stages,
+        mask_value=static.mask_value,
+        attn_logits_soft_cap=static.attn_logits_soft_cap,
+        save_residuals=save_residuals,
+        interpret=static.interpret,
+    )
   return kernel_lib._splash_attention_forward(
-      q, k, v, segment_ids,
-      schedule.num_steps, schedule.q_block_order, schedule.kv_block,
-      schedule.block_kind, schedule.mask_block, schedule.partial_mask_blocks,
+      q, k, v, segment_ids, *sched,
       mask_function=static.mask_function,
       block_sizes=static.block_sizes,
       mask_value=static.mask_value,
@@ -222,11 +252,14 @@ def _make_splash_attention(
     mask = mask_lib.MultiHeadMask(
         [mask_lib.NumpyMask(m) for m in mask]
     )
-  info = mask_info_lib.process_mask(
-      mask, (block_sizes.block_q, block_sizes.block_kv)
-  )
+  info = mask_info_lib.process_mask(mask, (128, block_sizes.block_kv))
+  fwd_info = None
+  if block_sizes.block_q != 128:
+    fwd_info = mask_info_lib.process_mask(
+        mask, (block_sizes.block_q, block_sizes.block_kv))
   return SplashAttentionKernel(
       info,
+      fwd_info=fwd_info,
       is_mqa=is_mqa,
       block_sizes=block_sizes,
       mask_value=mask_value,

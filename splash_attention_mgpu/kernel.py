@@ -87,8 +87,9 @@ class BlockSizes:
   num_stages_bwd: int = 2
 
   def __post_init__(self):
-    if self.block_q != BLOCK_Q:
-      raise ValueError(f"block_q must be {BLOCK_Q}, got {self.block_q}")
+    if self.block_q not in (BLOCK_Q, 2 * BLOCK_Q):
+      # 256 selects the two-tile ping-pong forward kernel.
+      raise ValueError(f"block_q must be 128 or 256, got {self.block_q}")
     if self.block_kv not in (64, 128):
       # Two f32 S buffers of 256 columns would fill all of TMEM.
       raise ValueError(f"block_kv must be 64 or 128, got {self.block_kv}")

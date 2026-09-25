@@ -30,8 +30,8 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import splash_attention_mgpu as sa  # noqa: E402
 
-BLOCK_SIZE_KEYS = ("block_kv", "num_stages", "block_kv_dq", "block_q_dkv",
-                   "num_stages_bwd")
+BLOCK_SIZE_KEYS = ("block_q", "block_kv", "num_stages", "block_kv_dq",
+                   "block_q_dkv", "num_stages_bwd")
 DEFAULTS = dict(mask="causal", seq=8192, heads=16, kv_heads=None, head_dim=128,
                 batch=1, backward=False, check=True, iters=20)
 
