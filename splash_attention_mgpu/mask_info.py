@@ -1,4 +1,4 @@
-# Copyright 2026. Licensed under the Apache License, Version 2.0.
+# Copyright 2026, Kuy Mainwaring (github.com/kuym). Licensed under the Apache 2.0 License.
 """Sparse block schedules for the Mosaic GPU splash attention kernel.
 
 The TPU kernel walks a dense (head, q_block, kv_block) grid and uses the

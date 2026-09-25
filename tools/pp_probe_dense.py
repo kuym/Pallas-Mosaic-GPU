@@ -1,3 +1,4 @@
+# Copyright 2026, Kuy Mainwaring (github.com/kuym). Licensed under the Apache 2.0 License.
 """Localize ping-pong dense-mask mismatches on hardware (debug tool)."""
 import os
 import sys

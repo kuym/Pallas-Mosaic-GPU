@@ -1,3 +1,4 @@
+# Copyright 2026, Kuy Mainwaring (github.com/kuym). Licensed under the Apache 2.0 License.
 """Profile the backward kernels (dQ and dK/dV) of one config; summarize.
 
   python tools/profile_bwd.py MASK SEQ HEAD_DIM [SPACE]

@@ -1,4 +1,4 @@
-# Copyright 2026. Licensed under the Apache License, Version 2.0.
+# Copyright 2026, Kuy Mainwaring (github.com/kuym). Licensed under the Apache 2.0 License.
 """Public API for Mosaic GPU splash attention, mirroring the TPU module.
 
   kernel = make_splash_mha(mask, block_sizes=BlockSizes())

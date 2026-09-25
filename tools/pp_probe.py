@@ -1,3 +1,4 @@
+# Copyright 2026, Kuy Mainwaring (github.com/kuym). Licensed under the Apache 2.0 License.
 """Run one small ping-pong forward case and report (used to debug hangs)."""
 import os, sys, time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))

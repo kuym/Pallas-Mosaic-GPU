@@ -1,3 +1,4 @@
+# Copyright 2026, Kuy Mainwaring (github.com/kuym). Licensed under the Apache 2.0 License.
 # One pod holding every GPU of an 8-GPU node; tools/gpu_farm.py runs inside it.
 apiVersion: v1
 kind: Pod

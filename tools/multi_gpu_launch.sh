@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Copyright 2026, Kuy Mainwaring (github.com/kuym). Licensed under the Apache 2.0 License.
 # Bring up an 8-GPU host (e.g. a Together 8xB200 node) and keep every GPU busy.
 #
 #   rsync -a --exclude .venv --exclude farm . HOST:splash/

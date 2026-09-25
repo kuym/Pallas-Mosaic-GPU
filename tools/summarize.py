@@ -1,4 +1,4 @@
-# Copyright 2026. Licensed under the Apache License, Version 2.0.
+# Copyright 2026, Kuy Mainwaring (github.com/kuym). Licensed under the Apache 2.0 License.
 """Summarize gpu_farm results: best tile sizes per problem, and failures.
 
   python tools/summarize.py farm/results.jsonl

@@ -1,4 +1,4 @@
-# Copyright 2026. Licensed under the Apache License, Version 2.0.
+# Copyright 2026, Kuy Mainwaring (github.com/kuym). Licensed under the Apache 2.0 License.
 """Submit a tile-size tuning sweep to gpu_farm.
 
   python tools/sweep.py --root farm [--quick] [--priority 20]

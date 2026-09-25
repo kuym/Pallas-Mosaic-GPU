@@ -1,4 +1,4 @@
-# Copyright 2026. Licensed under the Apache License, Version 2.0.
+# Copyright 2026, Kuy Mainwaring (github.com/kuym). Licensed under the Apache 2.0 License.
 """Test sharding for multi-GPU hosts.
 
 With FARM_SHARD="i/n" only every n-th collected test (offset i) runs, so a

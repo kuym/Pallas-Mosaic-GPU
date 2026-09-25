@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Copyright 2026, Kuy Mainwaring (github.com/kuym). Licensed under the Apache 2.0 License.
 # Drive tools/multi_gpu_launch.sh on a Together Kubernetes GPU cluster.
 #
 #   tools/k8s/run.sh kubeconfig CLUSTER_NAME   # write ./kubeconfig from the API
@@ -65,5 +66,5 @@ sys.stdout.write(base64.b64decode(c["kube_config"]).decode())' > kubeconfig)
     in_pod ". .venv-gpu/bin/activate && python tools/gpu_farm.py submit --root farm --priority $prio --name $name -- $*"
     ;;
   down) "${K[@]}" delete pod "$POD" --wait=true ;;
-  *) sed -n '2,12p' "$0"; exit 2 ;;
+  *) sed -n '3,13p' "$0"; exit 2 ;;
 esac

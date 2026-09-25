@@ -1,4 +1,4 @@
-# Copyright 2026. Licensed under the Apache License, Version 2.0.
+# Copyright 2026, Kuy Mainwaring (github.com/kuym). Licensed under the Apache 2.0 License.
 """Splash attention for NVIDIA Blackwell (sm_100) in Pallas Mosaic GPU."""
 
 from jax.experimental.pallas.ops.tpu.splash_attention.splash_attention_mask import (

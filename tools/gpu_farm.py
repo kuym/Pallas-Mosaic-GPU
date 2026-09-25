@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright 2026. Licensed under the Apache License, Version 2.0.
+# Copyright 2026, Kuy Mainwaring (github.com/kuym). Licensed under the Apache 2.0 License.
 """Keep every GPU of a multi-GPU host busy with a priority queue of jobs.
 
   gpu_farm.py serve  --root farm --gpus 0-7 [--filler "python tools/fuzz.py --minutes 10"]

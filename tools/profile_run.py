@@ -1,3 +1,4 @@
+# Copyright 2026, Kuy Mainwaring (github.com/kuym). Licensed under the Apache 2.0 License.
 """Profile one ping-pong forward config and summarize time per phase.
 
   SPLASH_PROFILE_DIR is set automatically.  Usage:

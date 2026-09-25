@@ -1,4 +1,4 @@
-# Copyright 2026. Licensed under the Apache License, Version 2.0.
+# Copyright 2026, Kuy Mainwaring (github.com/kuym). Licensed under the Apache 2.0 License.
 """Splash (block-sparse flash) attention for Blackwell in Pallas Mosaic GPU.
 
 This is a port of the TPU splash attention forward kernel

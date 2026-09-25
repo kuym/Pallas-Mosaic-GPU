@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Copyright 2026, Kuy Mainwaring (github.com/kuym). Licensed under the Apache 2.0 License.
 # Bootstrap a Lambda Cloud B200 instance and validate the kernel.
 #
 #   scp -r . ubuntu@<ip>:splash && ssh ubuntu@<ip> 'bash splash/tools/lambda_setup.sh'

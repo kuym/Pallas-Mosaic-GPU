@@ -1,4 +1,4 @@
-# Copyright 2026. Licensed under the Apache License, Version 2.0.
+# Copyright 2026, Kuy Mainwaring (github.com/kuym). Licensed under the Apache 2.0 License.
 """Backward pass of Mosaic GPU splash attention (Blackwell, sm_100).
 
 Like the TPU module, the backward pass is split in two kernels that recompute

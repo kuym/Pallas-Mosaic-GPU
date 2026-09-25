@@ -1,4 +1,4 @@
-# Copyright 2026. Licensed under the Apache License, Version 2.0.
+# Copyright 2026, Kuy Mainwaring (github.com/kuym). Licensed under the Apache 2.0 License.
 """Validate and benchmark splash attention on a Blackwell GPU.
 
   python tools/bench.py                          # default human-readable sweep

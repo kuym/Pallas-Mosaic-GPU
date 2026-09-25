@@ -1,3 +1,4 @@
+# Copyright 2026, Kuy Mainwaring (github.com/kuym). Licensed under the Apache 2.0 License.
 """Lower a Pallas Mosaic GPU function for sm_100a on a machine with no GPU.
 
 Runs the Python half of the Mosaic GPU pipeline (Pallas -> Mosaic GPU MLIR,

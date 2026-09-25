@@ -1,4 +1,4 @@
-# Copyright 2026. Licensed under the Apache License, Version 2.0.
+# Copyright 2026, Kuy Mainwaring (github.com/kuym). Licensed under the Apache 2.0 License.
 """Measure cuDNN flash attention on the same problems, as a practical ceiling.
 
   python tools/baseline.py            # results -> $FARM_RESULTS (kind=baseline)

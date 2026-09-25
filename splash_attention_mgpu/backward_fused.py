@@ -1,4 +1,4 @@
-# Copyright 2026. Licensed under the Apache License, Version 2.0.
+# Copyright 2026, Kuy Mainwaring (github.com/kuym). Licensed under the Apache 2.0 License.
 """Fused single-kernel backward pass (FA3/FA4 style) for head_dim 128.
 
 The split backward (backward.py) recomputes P in both the dQ and the dK/dV

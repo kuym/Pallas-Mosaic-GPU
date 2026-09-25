@@ -1,4 +1,4 @@
-# Copyright 2026. Licensed under the Apache License, Version 2.0.
+# Copyright 2026, Kuy Mainwaring (github.com/kuym). Licensed under the Apache 2.0 License.
 """Two-tile ("ping-pong") forward kernel, FlashAttention-4 style.
 
 Each CTA owns 256 query rows as two 128-row tiles that share every K/V block:
