@@ -22,6 +22,7 @@ head_dim 128 (bc = 64, dQ^T) and at head_dim 64 (bc = 128, dQ = dS K).
 from __future__ import annotations
 
 import functools
+import os
 from typing import Any
 
 import jax
@@ -53,7 +54,7 @@ def fused_smem_bytes(*, head_dim, num_stages, itemsize, has_dense_mask,
           + num_stages * bc * (2 * head_dim * itemsize + 8)
           + (num_stages * block_kv * bc if has_dense_mask else 0)
           + (block_kv + num_stages * bc) * 4 * has_segments
-          + block_kv * bc * itemsize  # dS^T for the dQ MMA
+          + 2 * block_kv * bc * itemsize  # dS^T for the dQ MMA (2 buffers)
           + head_dim * bc * 4)  # dQ(^T) staging
 
 
@@ -96,6 +97,11 @@ def splash_attention_bwd_fused(
   serialize_mma = interpret is not None
   ne = _num_elementwise_wgs(bc)
   w = bc // ne
+  # Issue the next step's S^T/dP^T before this step's dQ MMA; then the dQ MMA
+  # of step t may still read dS^T while the elementwise warpgroups write the
+  # next one, so dS^T is double-buffered in SMEM.
+  early_scores = os.environ.get("SPLASH_BWD_EARLY_S", "1") == "1"
+  ds_bufs = 2 if early_scores else 1
   _check_budgets(
       "fused backward kernel",
       tmem_cols=2 * bc + head_dim + head_dim_v + (bc if dq_transposed
@@ -222,8 +228,7 @@ def splash_attention_bwd_fused(
         def _mma_warp():
           plgpu.barrier_wait(kv_barrier)
 
-          def mma(t, h, mh, u):
-            del h, mh, u
+          def issue_scores(t):  # S^T(t), dP^T(t)
             slot = lax.rem(t, num_stages)
             if serialize_mma:
               # Interpreter only (no model of in-order tcgen05 execution):
@@ -239,6 +244,17 @@ def splash_attention_bwd_fused(
             plgpu.tcgen05_mma(dpt_tmem, v_smem, do_smem.at[slot].T,
                               accumulate=False)
             plgpu.tcgen05_commit_arrive(s_ready)
+
+          if early_scores:
+            @pl.when(n > 0)
+            def _():
+              issue_scores(jnp.int32(0))
+
+          def mma(t, h, mh, u):
+            del h, mh, u
+            slot = lax.rem(t, num_stages)
+            if not early_scores:
+              issue_scores(t)
             with jax.named_scope("mma_wait_p"):
               plgpu.barrier_wait(p_ready)
             plgpu.tcgen05_mma(dv_tmem, pt_tmem, do_smem.at[slot],
@@ -247,17 +263,25 @@ def splash_attention_bwd_fused(
                               accumulate=t > 0)
             if serialize_mma:
               plgpu.tcgen05_commit_arrive(mma_order)
+            if early_scores:
+              # The next step's scores go ahead of this step's dQ MMA (which
+              # reads dS^T from SMEM, not the TMEM the scores overwrite), so
+              # the elementwise warpgroups get S sooner.
+              @pl.when(t + 1 < n)
+              def _():
+                issue_scores(t + 1)
 
             @pl.when(t > 0)
             def _():  # the dQ writer has read dQ^T(t-1)
               with jax.named_scope("mma_wait_dq_free"):
                 plgpu.barrier_wait(dq_free)
+            ds_buf = ds_smem.at[lax.rem(t, ds_bufs)]
             if dq_transposed:
               for e in range(ne):  # dQ^T[:, e*w:(e+1)*w] = K^T dS^T_e
                 plgpu.tcgen05_mma(dqt_tmem.at[:, pl.ds(e * w, w)], k_smem.T,
-                                  ds_smem.at[e], accumulate=False)
+                                  ds_buf.at[e], accumulate=False)
             else:  # dQ = dS K, dS read as the transpose of dS^T
-              plgpu.tcgen05_mma(dqt_tmem, ds_smem.T, k_smem, accumulate=False)
+              plgpu.tcgen05_mma(dqt_tmem, ds_buf.T, k_smem, accumulate=False)
             plgpu.tcgen05_commit_arrive(dq_ready)
             # Releases the slot once every MMA reading Q / dO has completed.
             plgpu.tcgen05_commit_arrive(consumed.at[slot])
@@ -279,7 +303,7 @@ def splash_attention_bwd_fused(
 
       def step(t, h, mh, u):
         del h
-        slot = lax.rem(t, num_stages)
+        slot = lax.rem(t, num_stages)  # t is also used for the dS^T buffer
         _, row0, _ = step_rows(mh, u)
         row0 = row0 + e * w
         is_partial = (
@@ -332,10 +356,11 @@ def splash_attention_bwd_fused(
           ds16 = ds_t.astype(dtype)
           plgpu.async_store_tmem(pt_tmem.at[:, cols], p_t.astype(dtype))
           plgpu.async_store_tmem(dst_tmem.at[:, cols], ds16)
+          ds_buf = ds_smem.at[lax.rem(t, ds_bufs)]
           if dq_transposed:
-            ds_smem[e] = ds16  # B operand of the dQ^T MMA
+            ds_buf[e] = ds16  # B operand of the dQ^T MMA
           else:
-            ds_smem[:, cols] = ds16  # A operand (transposed) of the dQ MMA
+            ds_buf[:, cols] = ds16  # A operand (transposed) of the dQ MMA
           plgpu.commit_tmem()
           plgpu.commit_smem()  # dS^T for the async proxy; fences our reads
         plgpu.barrier_arrive(aux_consumed.at[slot])
@@ -411,8 +436,8 @@ def splash_attention_bwd_fused(
       plgpu.SMEM((bkv,), jnp.int32) if has_segments else None,
       plgpu.SMEM((num_stages, bc), jnp.int32) if has_segments else None,
       plgpu.SMEM((num_stages, bkv, bc), jnp.int8) if has_dense_mask else None,
-      plgpu.SMEM((ne, bkv, w) if dq_transposed else (bkv, bc), dtype,
-                 transforms=ds_t),
+      plgpu.SMEM((ds_bufs, ne, bkv, w) if dq_transposed
+                 else (ds_bufs, bkv, bc), dtype, transforms=ds_t),
       plgpu.SMEM((head_dim, bc) if dq_transposed else (bc, head_dim),
                  jnp.float32),
       None,
