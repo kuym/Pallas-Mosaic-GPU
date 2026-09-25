@@ -71,18 +71,31 @@ def _tree(op, xs):
   return xs[0]
 
 
-def exp2_emulated(x):
-  """2**x for x <= 0 on the FMA pipe: split x = r + f, polynomial for 2**f,
-  then add r to the float exponent.  x is clamped at -125 (2**-125 ~ 2e-38)
-  so the exponent never underflows."""
+SHIFTER = 12582912.0  # 1.5 * 2**23
+
+
+def exp2_emulated(x, shifter):
+  """2**x for x <= 0 on the FMA/ALU pipes, without float<->int conversions
+  (those run on the same low-throughput unit as MUFU.EX2).
+
+  Adding 1.5 * 2**23 rounds x to an integer r held in the low mantissa bits
+  of t; the low 9 bits of the constant's bit pattern are zero, so
+  bits(t) << 23 == r << 23 exactly, which is added to the exponent of the
+  polynomial for 2**(x - r).  x is clamped at -125 so the exponent never
+  underflows.
+
+  `shifter` must equal SHIFTER but be opaque to the compiler (a runtime
+  value): otherwise algebraic simplification folds (x + c) - c into x (XLA
+  does), which silently turns f into 0."""
   x = jnp.maximum(x, -125.0)
-  r = lax.round(x, lax.RoundingMethod.TO_NEAREST_EVEN)
-  f = x - r
+  t = x + shifter
+  f = x - (t - shifter)  # in [-0.5, 0.5]
   c0, c1, c2, c3 = _EXP2_COEFFS
   p = c0 + f * (c1 + f * (c2 + f * c3))
-  bits = lax.bitcast_convert_type(p, jnp.int32) + lax.shift_left(
-      r.astype(jnp.int32), jnp.int32(23))
-  return lax.bitcast_convert_type(bits, jnp.float32)
+  exponent = lax.shift_left(lax.bitcast_convert_type(t, jnp.int32),
+                            jnp.int32(23))
+  return lax.bitcast_convert_type(
+      lax.bitcast_convert_type(p, jnp.int32) + exponent, jnp.float32)
 
 
 def _profile_params():
@@ -364,6 +377,9 @@ def splash_attention_forward_pingpong(
 
       def body(s, carry):
         m_prev, l_prev = carry
+        # SHIFTER as a runtime value (see exp2_emulated): 0 * n is not
+        # foldable for floats.
+        shifter = jnp.float32(SHIFTER) + 0.0 * n.astype(jnp.float32)
         slot = lax.rem(s, num_stages)
         kv_blk = kv_block_gmem[mh, qi, s]
         with jax.named_scope("sm_wait_s"):
@@ -399,7 +415,8 @@ def splash_attention_forward_pingpong(
               continue
             # The first `exp_emulation_cols` columns use a polynomial on the
             # FMA pipe, relieving the special-function unit (FA4's trick).
-            p = exp2_emulated(x) if (i == 0 and exp_emulation_cols) else jnp.exp2(x)
+            p = (exp2_emulated(x, shifter) if (i == 0 and exp_emulation_cols)
+                 else jnp.exp2(x))
             ps.append(p)
           l_next = _tree(jnp.add, [l_prev * alpha] + [p.sum(axis=1) for p in ps])
         with jax.named_scope("sm_store_p"):

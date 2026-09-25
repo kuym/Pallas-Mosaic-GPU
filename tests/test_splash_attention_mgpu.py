@@ -519,3 +519,16 @@ def test_gpu_pingpong_grads(kwargs):
 def test_interpret_grads_independent_of_forward_tiling(block_sizes):
   # Found by the B200 fuzzer: gradients used to require block_kv == 128.
   _check_grads("dense", interpret=INTERPRET, block_sizes=block_sizes)
+
+
+def test_exp2_emulated():
+  from splash_attention_mgpu.forward_pingpong import SHIFTER, exp2_emulated
+  x = jnp.concatenate([jnp.linspace(-120, 0, 100001),
+                       jnp.array([-0.5, -1.5, -2.5])]).astype(jnp.float32)
+  # The shifter is passed as a runtime value: a constant would let XLA fold
+  # (x + c) - c into x and silently break the rounding.
+  got = np.asarray(jax.jit(exp2_emulated)(x, jnp.float32(SHIFTER)))
+  want = np.exp2(np.asarray(x, np.float64))
+  np.testing.assert_allclose(got, want, rtol=1e-4)
+  assert np.all(np.asarray(exp2_emulated(jnp.float32(-1e30),
+                                         jnp.float32(SHIFTER))) < 1e-37)
