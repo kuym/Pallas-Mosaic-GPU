@@ -99,7 +99,7 @@ phase, and no barrier can run more than one phase ahead of a waiter.
 ## Verification
 
 ```bash
-python -m venv .venv && .venv/bin/pip install jax pytest pytest-xdist absl-py
+bash tools/setup_venv.sh        # creates .venv from requirements.txt (Python >= 3.11)
 PYTHONPATH=. .venv/bin/python -m pytest tests -n 8
 ```
 

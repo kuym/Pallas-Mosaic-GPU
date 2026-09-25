@@ -1,0 +1,19 @@
+# Copyright 2026, Kuy Mainwaring (github.com/kuym). Licensed under the Apache 2.0 License.
+# Exact package set of the development .venv (CPU JAX: interpreter + sm_100 lowering).
+# Recreate with tools/setup_venv.sh. On a CUDA host use tools/multi_gpu_launch.sh.
+absl-py==2.5.0
+execnet==2.1.2
+iniconfig==2.3.0
+jax==0.11.2
+jaxlib==0.11.2
+ml_dtypes==0.6.0
+numpy==2.5.3
+opt_einsum==3.4.0
+packaging==26.3
+pluggy==1.6.0
+Pygments==2.21.0
+pytest==9.1.1
+pytest-xdist==3.8.0
+scipy==1.18.1
+setuptools==83.0.0
+wheel==0.47.0
