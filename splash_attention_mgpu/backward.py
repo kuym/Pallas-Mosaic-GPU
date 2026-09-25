@@ -25,6 +25,8 @@ TMEM columns for head dims up to 128.
 
 from __future__ import annotations
 
+import functools
+import os
 from typing import Any
 
 import jax
@@ -380,9 +382,15 @@ def splash_attention_bwd_dkv(
   itemsize = jnp.dtype(dtype).itemsize
   has_dense_mask = partial_mask_blocks_t is not None
   has_segments = segment_ids is not None
+  # Double-buffer S^T/dP^T (with P^T/dS^T aliased onto them) so the MMAs of
+  # step t+1 overlap the elementwise work of step t.  Needs a second SMEM
+  # stage (the prefetched step's Q/dO) and 4 * bc + dk + dv TMEM columns.
+  nbuf = 2 if (num_stages >= 2 and 4 * bc + head_dim + head_dim_v <= TMEM_COLS
+               and os.environ.get("SPLASH_BWD_DOUBLE_BUFFER", "1") == "1") else 1
+  serialize_mma = interpret is not None  # P^T aliases S^T in both modes
   _check_budgets(
       "dKV kernel",
-      tmem_cols=2 * bc + bc + head_dim + head_dim_v,
+      tmem_cols=2 * nbuf * bc + head_dim + head_dim_v,
       smem_bytes=(
           bkv * (head_dim + head_dim_v) * itemsize
           + num_stages * bc * ((head_dim + head_dim_v) * itemsize + 8)
@@ -410,10 +418,24 @@ def splash_attention_bwd_dkv(
     (
         k_smem, v_smem, q_smem, do_smem, lse_smem, delta_smem,
         kv_seg_smem, q_seg_smem, mask_smem,
-        st_tmem, dpt_tmem, pt_tmem, dst_tmem, dk_tmem, dv_tmem,
+        sp_unions, dd_unions, dk_tmem, dv_tmem,
         kv_barrier, q_barriers, mask_barriers,
-        consumed, aux_consumed, s_ready, p_ready, done,
+        consumed, aux_consumed, s_ready, p_ready, done, mma_order,
     ) = refs
+
+    def bufs(i):
+      """TMEM refs of buffer i (static): (S^T, dP^T, P^T, dS^T), where P^T
+      aliases S^T and dS^T aliases dP^T.  Each buffer is its own RefUnion."""
+      (st, pt), (dpt, dst) = sp_unions[i], dd_unions[i]
+      return st, dpt, pt, dst
+
+    def for_buffer(t, f):
+      """Runs f(i) for the static buffer index i == t % nbuf."""
+      if nbuf == 1:
+        f(0)
+        return
+      for i in range(nbuf):
+        pl.when(lax.rem(t, nbuf) == i)(functools.partial(f, i))
 
     hk = lax.axis_index("h")
     # Heaviest KV blocks first.  With per-head masks the order of the group's
@@ -516,24 +538,57 @@ def splash_attention_bwd_dkv(
         def _mma_warp():
           plgpu.barrier_wait(kv_barrier)
 
+          def issue_scores(t):
+            for_buffer(t, functools.partial(issue_scores_into, t))
+
+          def issue_scores_into(t, i):
+            slot = lax.rem(t, num_stages)
+            st, dpt, _, _ = bufs(i)
+            if serialize_mma:
+              # Interpreter only (it does not model in-order tcgen05
+              # execution): the dV/dK MMAs of step t-2 read this buffer.
+              @pl.when(t >= nbuf)
+              def _():
+                plgpu.barrier_wait(mma_order.at[lax.rem(t, nbuf)])
+            plgpu.barrier_wait(q_barriers.at[slot])
+            plgpu.tcgen05_mma(st, k_smem, q_smem.at[slot].T, accumulate=False)
+            plgpu.tcgen05_mma(dpt, v_smem, do_smem.at[slot].T,
+                              accumulate=False)
+            plgpu.tcgen05_commit_arrive(s_ready.at[lax.rem(t, nbuf)])
+
           def mma(t, h, mh, u):
             del h, mh, u
             slot = lax.rem(t, num_stages)
-            plgpu.barrier_wait(q_barriers.at[slot])
-            plgpu.tcgen05_mma(st_tmem, k_smem, q_smem.at[slot].T,
-                              accumulate=False)
-            plgpu.tcgen05_mma(dpt_tmem, v_smem, do_smem.at[slot].T,
-                              accumulate=False)
-            plgpu.tcgen05_commit_arrive(s_ready)
-            plgpu.barrier_wait(p_ready)
-            plgpu.tcgen05_mma(dv_tmem, pt_tmem, do_smem.at[slot],
-                              accumulate=t > 0)
-            plgpu.tcgen05_mma(dk_tmem, dst_tmem, q_smem.at[slot],
-                              accumulate=t > 0)
+            if nbuf == 1:
+              issue_scores(t)
+            else:
+              @pl.when(t + 1 < n)
+              def _():  # scores of the next step overlap this step's softmax
+                issue_scores(t + 1)
+            plgpu.barrier_wait(p_ready.at[lax.rem(t, nbuf)])
+
+            def grads(i):
+              _, _, pt, dst = bufs(i)
+              plgpu.tcgen05_mma(dv_tmem, pt, do_smem.at[slot],
+                                accumulate=t > 0)
+              plgpu.tcgen05_mma(dk_tmem, dst, q_smem.at[slot],
+                                accumulate=t > 0)
+            for_buffer(t, grads)
             # Releases the slot once both the dV and dK MMAs have read it.
             plgpu.tcgen05_commit_arrive(consumed.at[slot])
+            if serialize_mma:
+              plgpu.tcgen05_commit_arrive(mma_order.at[lax.rem(t, nbuf)])
 
+          if nbuf == 2:
+            @pl.when(n > 0)
+            def _():
+              issue_scores(jnp.int32(0))
           for_each_step(mma)
+          if serialize_mma:
+            # Observe the last dV/dK completion of each buffer.
+            @pl.loop(jnp.maximum(n - nbuf, 0), n)
+            def _(t):
+              plgpu.barrier_wait(mma_order.at[lax.rem(t, nbuf)])
 
           @pl.when(n > 0)
           def _():
@@ -578,21 +633,26 @@ def splash_attention_bwd_dkv(
         plgpu.barrier_wait(q_barriers.at[slot])  # lse / delta / q segment ids
         lse = plgpu.load(lse_smem.at[slot], layout=_COLS)
         delta = plgpu.load(delta_smem.at[slot], layout=_COLS)
-        plgpu.barrier_wait(s_ready)
-        logits_t = plgpu.async_load_tmem(st_tmem)
-        dp_t = plgpu.async_load_tmem(dpt_tmem)
-        plgpu.wait_load_tmem()
+        plgpu.barrier_wait(s_ready.at[lax.rem(t, nbuf)])
+        for_buffer(t, functools.partial(elementwise, t, slot, masks, lse, delta))
+        plgpu.commit_smem()  # Fence generic reads before TMA overwrites.
+        plgpu.barrier_arrive(aux_consumed.at[slot])
+        plgpu.barrier_arrive(p_ready.at[lax.rem(t, nbuf)])
+
+      def elementwise(t, slot, masks, lse, delta, i):
+        del t, slot
+        st, dpt, pt, dst = bufs(i)
+        logits_t = plgpu.async_load_tmem(st)
+        dp_t = plgpu.async_load_tmem(dpt)
+        plgpu.wait_load_tmem()  # P^T / dS^T overwrite these columns below
         p_t, ds_t = _probs_and_dlogits(
             logits_t, dp_t, lse, delta, masks=masks,
             soft_cap=attn_logits_soft_cap, mask_value=mask_value,
             lse_dims=[1],
         )
-        plgpu.async_store_tmem(pt_tmem, p_t.astype(dtype))
-        plgpu.async_store_tmem(dst_tmem, ds_t.astype(dtype))
+        plgpu.async_store_tmem(pt, p_t.astype(dtype))
+        plgpu.async_store_tmem(dst, ds_t.astype(dtype))
         plgpu.commit_tmem()
-        plgpu.commit_smem()  # Fence generic reads before TMA overwrites.
-        plgpu.barrier_arrive(aux_consumed.at[slot])
-        plgpu.barrier_arrive(p_ready)
 
       for_each_step(softmax)
 
@@ -627,10 +687,12 @@ def splash_attention_bwd_dkv(
       plgpu.SMEM((bkv,), jnp.int32) if has_segments else None,
       plgpu.SMEM((num_stages, bc), jnp.int32) if has_segments else None,
       plgpu.SMEM((num_stages, bkv, bc), jnp.int8) if has_dense_mask else None,
-      plgpu.TMEM((bkv, bc), jnp.float32),
-      plgpu.TMEM((bkv, bc), jnp.float32),
-      plgpu.TMEM((bkv, bc), dtype, packed=True),
-      plgpu.TMEM((bkv, bc), dtype, packed=True),
+      [plgpu.RefUnion(plgpu.TMEM((bkv, bc), jnp.float32),
+                      plgpu.TMEM((bkv, bc), dtype, packed=True))
+       for _ in range(nbuf)],
+      [plgpu.RefUnion(plgpu.TMEM((bkv, bc), jnp.float32),
+                      plgpu.TMEM((bkv, bc), dtype, packed=True))
+       for _ in range(nbuf)],
       plgpu.TMEM((bkv, head_dim), jnp.float32),
       plgpu.TMEM((bkv, head_dim_v), jnp.float32),
       plgpu.Barrier(num_arrivals=2 + has_segments),
@@ -638,9 +700,11 @@ def splash_attention_bwd_dkv(
       plgpu.Barrier(num_barriers=num_stages) if has_dense_mask else None,
       plgpu.Barrier(num_barriers=num_stages, orders_tensor_core=True),
       plgpu.Barrier(num_barriers=num_stages),
+      plgpu.Barrier(num_barriers=nbuf, orders_tensor_core=True),
+      plgpu.Barrier(num_barriers=nbuf, orders_tensor_core=True),
       plgpu.Barrier(orders_tensor_core=True),
-      plgpu.Barrier(orders_tensor_core=True),
-      plgpu.Barrier(orders_tensor_core=True),
+      plgpu.Barrier(num_barriers=nbuf, orders_tensor_core=True)
+      if serialize_mma else None,
   ]
   inputs = [q, k, v, do, lse, delta]
   if has_segments:
