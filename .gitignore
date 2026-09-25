@@ -6,3 +6,5 @@ farm/
 farm.log
 cpu_tests.log
 .venv-gpu/
+kubeconfig
+farm-remote/

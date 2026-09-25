@@ -1,0 +1,23 @@
+# One pod holding every GPU of an 8-GPU node; tools/gpu_farm.py runs inside it.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: splash-farm
+  labels: {app: splash-farm}
+spec:
+  restartPolicy: Never
+  containers:
+    - name: farm
+      image: ubuntu:24.04
+      command: ["sleep", "infinity"]
+      env:
+        - {name: NVIDIA_DRIVER_CAPABILITIES, value: "compute,utility"}
+        - {name: DEBIAN_FRONTEND, value: noninteractive}
+      resources:
+        limits: {nvidia.com/gpu: 8}
+        requests: {nvidia.com/gpu: 8, cpu: "32", memory: 256Gi}
+      volumeMounts:
+        - {name: dshm, mountPath: /dev/shm}
+  volumes:
+    - name: dshm
+      emptyDir: {medium: Memory, sizeLimit: 64Gi}
