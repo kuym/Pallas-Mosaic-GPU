@@ -17,6 +17,13 @@ out, (lse,) = kernel(q, k, v, save_residuals=True)
 
 As in the TPU kernel, `q` is expected to be pre-scaled.
 
+**Status (2026-09-25).** The forward and backward kernels run correctly on
+real B200s. They were tested on a Together AI 8×B200 node: the native test
+suite passes, and 1,020 randomized fuzz cases (415 of them with gradients)
+produced no failures. Forward throughput is 55–60% of cuDNN's flash attention
+at head_dim 128; see [Performance](#performance-on-b200). Optimization is in
+progress.
+
 ## Features
 
 | | |
@@ -28,6 +35,7 @@ As in the TPU kernel, `q` is expected to be pre-scaled.
 | Gradients | `custom_vjp` with dQ and dK/dV Mosaic GPU kernels (split like the TPU module) |
 | Dtypes | bf16, f16 (f32 accumulation) |
 | Head dims | Forward: multiples of 64 up to 256 (`block_kv=64` for 256). Backward: up to 128 |
+| Kernels | `block_q=128` (default): one softmax warpgroup per CTA. `block_q=256`: experimental two-tile "ping-pong" kernel (FlashAttention-4 style), head_dim 64/128 |
 
 ## Design
 
@@ -55,6 +63,14 @@ The two S buffers let the QK MMA of step s+1 run under the softmax of step s.
 O is rescaled in TMEM only when some row's running max grows by more than
 2^8 (as in FlashAttention-4). TMEM holds O (`head_dim` columns), two S
 buffers and P, which is at most 512 columns.
+
+**Two-tile ping-pong kernel** (`forward_pingpong.py`, `BlockSizes(block_q=256)`).
+Each CTA holds 256 query rows as two 128-row tiles over the same K/V blocks.
+Each tile has its own softmax warpgroup, plus one producer warpgroup. The MMA
+warp interleaves the tiles: `PV0(j) S0(j+1) | PV1(j) S1(j+1)`. The tensor core
+therefore works on one tile while the other tile's softmax runs. P is stored
+in TMEM over S (`RefUnion`), so two tiles × (S/P + O) fit in the 512 TMEM
+columns at head_dim 128. The sparse schedule is built at 256-row granularity.
 
 **Backward kernels** (`backward.py`). The same warp specialization is used.
 The dQ kernel recomputes S and dP = dO Vᵀ for each KV sub-block, forms
@@ -97,17 +113,105 @@ scp -r . ubuntu@<ip>:splash
 ssh ubuntu@<ip> 'bash splash/tools/lambda_setup.sh'   # tests + tools/bench.py
 ```
 
-Tiers 1 and 2 pass. Tier 3 (native execution and benchmarks) has not been run
-yet, because no B200 was available while this was written.
+All three tiers pass. Tier 3 ran on a Together AI 8×B200 node.
+
+### Running on a multi-GPU host
+
+Expensive multi-GPU machines are driven by `tools/gpu_farm.py`, a priority
+job queue that keeps every GPU busy:
+
+- One job runs per GPU (`CUDA_VISIBLE_DEVICES`), and a GPU starts its next
+  job as soon as it finishes one. Jobs can be submitted while the farm runs.
+- Idle GPUs run the correctness fuzzer, `tools/fuzz.py`, which checks random
+  masks, shapes, GQA/MQA, segments, soft-cap and dtypes, forward and
+  gradients, against the reference.
+- Fuzzer jobs are pre-empted as soon as real work is queued.
+- Test suites are sharded one shard per GPU (`FARM_SHARD=i/n`).
+- `tools/sweep.py` submits tile-size sweeps, and `tools/summarize.py` reports
+  the best configuration per problem.
+- Every job runs under a hard timeout, so a hung kernel cannot hold a GPU.
+
+`tools/multi_gpu_launch.sh` brings up a host. For a Together Kubernetes
+cluster, `tools/k8s/run.sh {kubeconfig,up,sync,status,submit,fetch,down}`
+drives the same thing through one pod that holds all 8 GPUs.
+
+## Performance on B200
+
+These are bf16 forward TFLOP/s measured with CUDA events on a Together AI
+8×B200 node (driver 610, CUDA 13.3, JAX 0.11), using the best tile sizes from
+the sweep. Splash TFLOP/s count only the visible (computed) 128×128 blocks. The
+cuDNN baseline, `tools/baseline.py`, is `jax.nn.dot_product_attention(implementation="cudnn")`.
+
+| Problem (H=16, MHA unless noted) | Splash `block_q=128` fwd | cuDNN fwd | Splash fwd+bwd | cuDNN fwd+bwd |
+|---|---|---|---|---|
+| full, S=16K, D=128 | 866 | 1,571 | 695 | 1,317 |
+| full, S=16K, D=128, GQA 32/8 | 875 | 1,574 | 700 | 1,299 |
+| causal, S=16K, D=128 | 840 | 1,398 | 632 | 1,317 |
+| full, S=4K, D=128, GQA 32/8 | 892 | 1,396 | 636 | 1,239 |
+| full, S=16K, D=64 | 628 | 999 | 435 | 919 |
+| causal, S=16K, D=64 | 556 | 946 | 381 | 890 |
+| local (1K window), S=16K, D=128 | 609 | — | 480 | — |
+| chunked-causal (2K), S=16K, D=128 | 550 | — | 461 | — |
+
+For causal masks, the 128×128 accounting counts whole diagonal blocks, which
+is 0.8% more FLOPs than cuDNN's S²/2 at 16K.
+
+**Roofline.** Per score element the tensor cores do `4·d` FLOPs, at about
+8,192 FLOP/clk/SM, and the special-function unit does one `exp2`, at 16/clk/SM.
+At d=128 both take 0.0625 clk, so the kernel can reach about 2.2 PF only if
+the two are perfectly overlapped. At d=64 the exponentials are the bottleneck,
+at about 1.1 PF. cuDNN reaches about 70% of peak (1.57 PF) at d=128, which is
+the practical target.
+
+**Where the gap comes from.** The `block_q=128` kernel has a single softmax
+warpgroup, and its per-block softmax takes about as long as the block's MMAs,
+so the tensor core idles for part of each step. Sparse masks with short rows
+(local, chunked) also pay a per-row prologue and epilogue cost.
+
+## Hardware findings
+
+These were found on B200. None of them shows up in the CPU interpreter:
+
+1. **tcgen05 needs 16-bit contraction dims in multiples of 64.** Backward
+   sub-blocks of 32 fail to lower (`K must be a multiple of 64`), so
+   `block_kv_dq` and `block_q_dkv` must be 64 or 128.
+2. **`setmaxnreg` must leave slack.** Splitting 2×240 + 32 registers across
+   three warpgroups uses exactly the SM's 65,536 registers, and
+   `setmaxnreg.inc` then waits forever: a deadlock at full "utilization" and
+   about 245 W. 232/40 (64,512 registers) works.
+3. **Cross-warp reduction scratch is shared by all warpgroups.** Mosaic GPU
+   places every cross-warp reduction's SMEM scratch at the same offset. Two
+   softmax warpgroups each reducing a per-row flag to a scalar clobber each
+   other. This gave wrong results with dense masks and deadlocks with local
+   masks, where warps disagree on a branch that contains warpgroup barriers.
+   The ping-pong kernel therefore avoids scalar reductions. Per-row reductions
+   in the TCGEN05 layout stay within a thread and are safe.
+4. The CPU interpreter scopes an MMA's `barrier=` to that MMA alone and does
+   not model the in-order execution of tcgen05 MMAs. The kernels therefore
+   use explicit `tcgen05_commit_arrive` calls. The ping-pong kernel adds
+   interpret-only waits that stand in for the in-order guarantee.
 
 ## Tuning
 
-`BlockSizes(block_kv=128, num_stages=2, block_kv_dq=64, block_q_dkv=64,
-num_stages_bwd=2)`. The kernel validates its SMEM (227 KiB) and TMEM
-(512 columns) budgets up front and raises a `ValueError` with the numbers.
-`tools/bench.py` sweeps masks, sequence lengths and head dims, and reports
-TFLOP/s over the visible blocks.
+The defaults are `BlockSizes(block_q=128, block_kv=128, num_stages=2,
+block_kv_dq=64, block_q_dkv=64, num_stages_bwd=2)`. The kernels validate
+their SMEM (227 KiB) and TMEM (512 columns) budgets up front and raise a
+`ValueError` with the numbers. Set `block_q=256` to use the ping-pong forward
+kernel.
 
-Possible next steps once hardware numbers exist: two ping-ponged Q tiles per
-CTA (FlashAttention-4 style), partial exp2 emulation on the FMA units,
-double-buffered S in the backward kernels, and a persistent tile scheduler.
+## Optimization plan
+
+Each step is A/B-benchmarked on the farm over the full problem grid and fuzzed
+before it is kept:
+
+1. Two ping-ponged Q tiles per CTA (`block_q=256`). In progress: it is
+   correct on B200 after findings 2 and 3 above, and being re-measured.
+2. Compute a fraction of the `exp2` calls with a cubic polynomial on the FMA
+   units. The polynomial is ready, with 7.6e-5 maximum relative error.
+3. A dedicated correction warpgroup that rescales O and runs the epilogue off
+   the softmax critical path.
+4. A persistent kernel with a heaviest-first tile scheduler and overlapped
+   epilogue and prologue, for sparse masks with short rows. After that, 2-CTA
+   (`M=256`) MMAs with multicast K/V.
+5. Backward: double-buffered Sᵀ/dPᵀ in the dK/dV kernel, and a fused
+   single-pass backward with a TMA reduce-add for dQ.
