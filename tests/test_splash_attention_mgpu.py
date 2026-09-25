@@ -557,3 +557,33 @@ def test_auto_block_q_respects_smem():
   assert sa.make_splash_mha(
       sa.NumpyMask(dense), block_sizes=sa.BlockSizes(block_kv=64)
   ).choose_block_q(128, 128) == 256
+
+
+# head_dim 128 uses the fused single-kernel backward (backward_fused.py).
+GRAD_CASES_D128 = [
+    dict(mask_name="full", d=128),
+    dict(mask_name="causal", d=128),
+    dict(mask_name="local", d=128, segments=True),
+    dict(mask_name="chunked", d=128),
+    dict(mask_name="dense", d=128),
+    dict(mask_name="dense", d=128, segments=True),
+    dict(mask_name="causal", d=128, cap=5.0),
+    dict(mask_name="causal", d=128, h=4, kvh=2),
+    dict(mask_name="causal", d=128, mqa=True, h=3),
+    dict(mask_name="causal", d=128, b=2),
+    dict(mask_name="causal", d=128, multi_head_mask=True, h=3),
+    dict(mask_name="causal", d=128, dtype=jnp.float16),
+]
+
+
+@pytest.mark.parametrize("kwargs", GRAD_CASES_D128, ids=_case_id)
+def test_interpret_grads_fused(kwargs):
+  kwargs = dict(kwargs)
+  _check_grads(kwargs.pop("mask_name"), interpret=INTERPRET, **kwargs)
+
+
+@needs_blackwell
+@pytest.mark.parametrize("kwargs", GRAD_CASES_D128, ids=_case_id)
+def test_gpu_grads_fused(kwargs):
+  kwargs = dict(kwargs)
+  _check_grads(kwargs.pop("mask_name"), s=2048, **kwargs)

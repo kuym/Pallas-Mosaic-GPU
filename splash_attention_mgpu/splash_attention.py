@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import os
 from typing import Any, NamedTuple
 
 import jax
@@ -23,6 +24,7 @@ from jax.experimental.pallas.ops.tpu.splash_attention import (
 )
 
 from . import backward as backward_lib
+from . import backward_fused
 from . import forward_pingpong
 from . import kernel as kernel_lib
 from . import mask_info as mask_info_lib
@@ -294,6 +296,14 @@ def _attention_bwd(static, residuals, do):
       attn_logits_soft_cap=static.attn_logits_soft_cap,
       interpret=static.interpret,
   )
+  if (backward_fused.fused_supported(q.shape[-1], v.shape[-1])
+      and os.environ.get("SPLASH_BWD_FUSED", "1") == "1"):
+    dq, dk, dv = backward_fused.splash_attention_bwd_fused(
+        q, k, v, do, lse, delta, segment_ids,
+        schedule.dkv_num_steps, schedule.dkv_kv_block_order,
+        schedule.dkv_q_block, schedule.dkv_block_kind,
+        schedule.dkv_mask_block, schedule.partial_mask_blocks_t, **common)
+    return dq, dk, dv, None, None
   dq = backward_lib.splash_attention_bwd_dq(
       q, k, v, do, lse, delta, segment_ids,
       schedule.num_steps, schedule.q_block_order, schedule.kv_block,
