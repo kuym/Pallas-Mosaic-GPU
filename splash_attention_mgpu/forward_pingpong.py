@@ -63,6 +63,14 @@ _EXP2_COEFFS = (0.9999275516718514, 0.6932516151409869, 0.24261537603713018,
                 0.05522259924620865)
 
 
+def _tree(op, xs):
+  """Combines xs pairwise (a balanced tree, not a serial chain)."""
+  while len(xs) > 1:
+    xs = [op(xs[i], xs[i + 1]) if i + 1 < len(xs) else xs[i]
+          for i in range(0, len(xs), 2)]
+  return xs[0]
+
+
 def exp2_emulated(x):
   """2**x for x <= 0 on the FMA pipe: split x = r + f, polynomial for 2**f,
   then add r to the float exponent.  x is clamped at -125 (2**-125 ~ 2e-38)
@@ -105,6 +113,7 @@ def splash_attention_forward_pingpong(
     softmax_registers: int | None = None,
     producer_registers: int | None = None,
     exp_emulation_cols: int | None = None,
+    softmax_parts: int | None = None,
     interpret: Any = None,
 ):
   batch, num_q_heads, q_seq_len, head_dim = q.shape
@@ -153,8 +162,21 @@ def splash_attention_forward_pingpong(
   if exp_emulation_cols % 16 or not 0 <= exp_emulation_cols < bkv:
     raise ValueError(f"exp_emulation_cols={exp_emulation_cols} must be a "
                      f"multiple of 16 in [0, {bkv})")
-  parts = ([(0, exp_emulation_cols), (exp_emulation_cols, bkv - exp_emulation_cols)]
-           if exp_emulation_cols else [(0, bkv)])
+  # The S tile is processed as independent column slices: the per-row max and
+  # sum of each slice are separate dependency chains, which the compiler
+  # otherwise emits as one long serial chain per row (latency-bound with only
+  # two softmax warps per SM sub-partition).
+  if softmax_parts is None:
+    softmax_parts = int(os.environ.get("SPLASH_SOFTMAX_PARTS", 1))
+  if bkv % softmax_parts or (bkv // softmax_parts) % 16:
+    raise ValueError(f"softmax_parts={softmax_parts} must split block_kv="
+                     f"{bkv} into multiples of 16 columns")
+  if exp_emulation_cols:
+    parts = [(0, exp_emulation_cols),
+             (exp_emulation_cols, bkv - exp_emulation_cols)]
+  else:
+    w = bkv // softmax_parts
+    parts = [(i * w, w) for i in range(softmax_parts)]
   if num_steps.shape[1] != q_seq_len // CTA_ROWS:
     raise ValueError("mask info must be built with block_q=256")
 
@@ -359,21 +381,18 @@ def splash_attention_forward_pingpong(
             plgpu.commit_smem()  # Fence generic reads before TMA overwrites.
             plgpu.barrier_arrive(aux_consumed.at[slot])
         with jax.named_scope("sm_exp"):
-          m_curr = m_prev
-          for x in qks:
-            m_curr = jnp.maximum(m_curr, x.max(axis=1))
+          m_curr = _tree(jnp.maximum, [m_prev] + [x.max(axis=1) for x in qks])
           needs_rescale = m_curr - m_prev > RESCALE_THRESHOLD
           m_next = _where(needs_rescale, m_curr, m_prev)
           alpha = jnp.exp2(m_prev - m_next)
-          l_next = l_prev * alpha
           ps = []
           for i, x in enumerate(qks):
             x = x - lax.broadcast_in_dim(m_next, x.shape, [0])
             # The first `exp_emulation_cols` columns use a polynomial on the
             # FMA pipe, relieving the special-function unit (FA4's trick).
             p = exp2_emulated(x) if (i == 0 and exp_emulation_cols) else jnp.exp2(x)
-            l_next = l_next + p.sum(axis=1)
             ps.append(p)
+          l_next = _tree(jnp.add, [l_prev * alpha] + [p.sum(axis=1) for p in ps])
         with jax.named_scope("sm_store_p"):
           for p, (c0, nc) in zip(ps, parts):
             plgpu.async_store_tmem(p_tmems[t].at[:, pl.ds(c0, nc)],
