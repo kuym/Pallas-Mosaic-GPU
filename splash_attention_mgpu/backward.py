@@ -35,6 +35,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
+from . import forward_pingpong
 from . import mask_info as mask_info_lib
 from .kernel import (
     LOG2E,
@@ -226,8 +227,9 @@ def splash_attention_bwd_dq(
           @pl.loop(0, n)
           def _mma_loop(t):
             slot = lax.rem(t, num_stages)
-            plgpu.barrier_wait(k_barriers.at[slot])
-            plgpu.barrier_wait(v_barriers.at[slot])
+            with jax.named_scope("mma_wait_kv"):
+              plgpu.barrier_wait(k_barriers.at[slot])
+              plgpu.barrier_wait(v_barriers.at[slot])
             # S/dP of step t-1 were consumed before ds_ready(t-1), and the
             # dQ MMA of step t-1 is ordered before these by the tensor core.
             plgpu.tcgen05_mma(s_tmem, q_smem, k_smem.at[slot].T,
@@ -235,7 +237,8 @@ def splash_attention_bwd_dq(
             plgpu.tcgen05_mma(dp_tmem, do_smem, v_smem.at[slot].T,
                               accumulate=False)
             plgpu.tcgen05_commit_arrive(s_ready)
-            plgpu.barrier_wait(ds_ready)
+            with jax.named_scope("mma_wait_ds"):
+              plgpu.barrier_wait(ds_ready)
             plgpu.tcgen05_mma(dq_tmem, ds_tmem, k_smem.at[slot],
                               kv_consumed.at[slot], accumulate=t > 0)
 
@@ -285,16 +288,20 @@ def splash_attention_bwd_dq(
             x = _where(same, x, mask_value)
           return x
 
-        plgpu.barrier_wait(s_ready)
-        logits = plgpu.async_load_tmem(s_tmem.at[:, cols])
-        dp = plgpu.async_load_tmem(dp_tmem.at[:, cols])
-        plgpu.wait_load_tmem()
-        _, ds = _probs_and_dlogits(
-            logits, dp, lse_rows, delta_rows, masks=masks,
-            soft_cap=attn_logits_soft_cap, mask_value=mask_value,
-            lse_dims=[0],
-        )
-        plgpu.async_store_tmem(ds_tmem.at[:, cols], ds.astype(dtype))
+        with jax.named_scope("ew_wait_s"):
+          plgpu.barrier_wait(s_ready)
+        with jax.named_scope("ew_load"):
+          logits = plgpu.async_load_tmem(s_tmem.at[:, cols])
+          dp = plgpu.async_load_tmem(dp_tmem.at[:, cols])
+          plgpu.wait_load_tmem()
+        with jax.named_scope("ew_math"):
+          _, ds = _probs_and_dlogits(
+              logits, dp, lse_rows, delta_rows, masks=masks,
+              soft_cap=attn_logits_soft_cap, mask_value=mask_value,
+              lse_dims=[0],
+          )
+        with jax.named_scope("ew_store"):
+          plgpu.async_store_tmem(ds_tmem.at[:, cols], ds.astype(dtype))
         plgpu.commit_tmem()
         if has_aux:
           plgpu.commit_smem()  # Fence generic reads before TMA overwrites.
@@ -568,7 +575,8 @@ def splash_attention_bwd_dkv(
               @pl.when(t >= nbuf)
               def _():
                 plgpu.barrier_wait(mma_order.at[lax.rem(t, nbuf)])
-            plgpu.barrier_wait(q_barriers.at[slot])
+            with jax.named_scope("mma_wait_q"):
+              plgpu.barrier_wait(q_barriers.at[slot])
             plgpu.tcgen05_mma(st, k_smem, q_smem.at[slot].T, accumulate=False)
             plgpu.tcgen05_mma(dpt, v_smem, do_smem.at[slot].T,
                               accumulate=False)
@@ -583,7 +591,8 @@ def splash_attention_bwd_dkv(
               @pl.when(t + 1 < n)
               def _():  # scores of the next step overlap this step's softmax
                 issue_scores(t + 1)
-            plgpu.barrier_wait(p_ready.at[lax.rem(t, nbuf)])
+            with jax.named_scope("mma_wait_p"):
+              plgpu.barrier_wait(p_ready.at[lax.rem(t, nbuf)])
 
             def grads(i):
               _, _, pt, dst = bufs(i)
@@ -651,10 +660,12 @@ def splash_attention_bwd_dkv(
             x = _where(same, x, mask_value)
           return x
 
-        plgpu.barrier_wait(q_barriers.at[slot])  # lse / delta / q segment ids
+        with jax.named_scope("ew_wait_q"):
+          plgpu.barrier_wait(q_barriers.at[slot])  # lse / delta / q seg ids
         lse = plgpu.load(lse_smem.at[slot, cols], layout=_COLS)
         delta = plgpu.load(delta_smem.at[slot, cols], layout=_COLS)
-        plgpu.barrier_wait(s_ready.at[lax.rem(t, nbuf)])
+        with jax.named_scope("ew_wait_s"):
+          plgpu.barrier_wait(s_ready.at[lax.rem(t, nbuf)])
         for_buffer(t, functools.partial(elementwise, t, slot, masks, lse, delta))
         plgpu.commit_smem()  # Fence generic reads before TMA overwrites.
         plgpu.barrier_arrive(aux_consumed.at[slot])
@@ -663,23 +674,26 @@ def splash_attention_bwd_dkv(
       def elementwise(t, slot, masks, lse, delta, i):
         del t, slot
         st, dpt, pt, dst = (r.at[:, cols] for r in bufs(i))
-        logits_t = plgpu.async_load_tmem(st)
-        dp_t = plgpu.async_load_tmem(dpt)
-        plgpu.wait_load_tmem()  # P^T / dS^T overwrite these columns below
+        with jax.named_scope("ew_load"):
+          logits_t = plgpu.async_load_tmem(st)
+          dp_t = plgpu.async_load_tmem(dpt)
+          plgpu.wait_load_tmem()  # P^T / dS^T overwrite these columns below
         if ne > 1:
           # Packed bf16 P^T/dS^T use half the columns of S^T/dP^T, so a
           # warpgroup's P^T lands in columns another warpgroup reads S^T
           # from: every warpgroup must have loaded before any stores.
           plgpu.barrier_arrive(loaded.at[i])
           plgpu.barrier_wait(loaded.at[i])
-        p_t, ds_t = _probs_and_dlogits(
-            logits_t, dp_t, lse, delta, masks=masks,
-            soft_cap=attn_logits_soft_cap, mask_value=mask_value,
-            lse_dims=[1],
-        )
-        plgpu.async_store_tmem(pt, p_t.astype(dtype))
-        plgpu.async_store_tmem(dst, ds_t.astype(dtype))
-        plgpu.commit_tmem()
+        with jax.named_scope("ew_math"):
+          p_t, ds_t = _probs_and_dlogits(
+              logits_t, dp_t, lse, delta, masks=masks,
+              soft_cap=attn_logits_soft_cap, mask_value=mask_value,
+              lse_dims=[1],
+          )
+        with jax.named_scope("ew_store"):
+          plgpu.async_store_tmem(pt, p_t.astype(dtype))
+          plgpu.async_store_tmem(dst, ds_t.astype(dtype))
+          plgpu.commit_tmem()
 
       for_each_step(softmax)
 
@@ -789,6 +803,7 @@ def _launch(kernel, scratch_types, inputs, *, out_type, grid,
       compiler_params=plgpu.CompilerParams(
           lowering_semantics=plgpu.LoweringSemantics.Warpgroup,
           approx_math=True,
+          **forward_pingpong._profile_params(),
       ),
       interpret=interpret,
   )(*inputs)
