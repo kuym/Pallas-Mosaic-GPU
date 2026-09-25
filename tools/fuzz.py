@@ -52,6 +52,12 @@ def draw(seed):
   )
   if case["block_sizes"]["block_kv_dq"] > block_kv:
     case["block_sizes"]["block_kv_dq"] = block_kv
+  # Half the cases exercise the two-tile ping-pong forward kernel.
+  if seq % 256 == 0 and r.random() < 0.5:
+    case["block_sizes"]["block_q"] = 256
+    if case["mask"] == "dense" or case["per_head_masks"]:
+      case["block_sizes"]["block_kv"] = 64  # SMEM for 256-row mask blocks
+      case["block_sizes"]["block_kv_dq"] = 64
   return case
 
 
