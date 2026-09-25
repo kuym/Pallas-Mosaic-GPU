@@ -131,6 +131,7 @@ def splash_attention_forward_pingpong(
     exp_emulation_cols: int | None = None,
     softmax_parts: int | None = None,
     correction: bool | None = None,
+    schedule: bool | None = None,
     interpret: Any = None,
 ):
   batch, num_q_heads, q_seq_len, head_dim = q.shape
@@ -168,6 +169,8 @@ def splash_attention_forward_pingpong(
   # overrides it for experiments; "0,0" disables register reallocation.
   if correction is None:
     correction = os.environ.get("SPLASH_CORRECTION", "0") == "1"
+  if schedule is None:
+    schedule = os.environ.get("SPLASH_SCHEDULE", "1") == "1"
   correction_registers = 64
   env_regs = os.environ.get("SPLASH_PP_REGS")
   if env_regs:
@@ -232,7 +235,7 @@ def splash_attention_forward_pingpong(
         sp0, sp1, o_tmem,
         q_barrier, k_barriers, v_barriers, seg_barriers, mask_barriers,
         kv_consumed, aux_consumed, s_ready, p_ready, o_done, pv_order,
-        alpha_smem, alpha_ready, alpha_consumed, o_free, o_corrected,
+        alpha_smem, alpha_ready, alpha_consumed, o_free, o_corrected, turn,
     ) = refs
     CORRECTION_WG = NUM_TILES
     PRODUCER_WG = NUM_TILES + int(correction)
@@ -411,6 +414,16 @@ def splash_attention_forward_pingpong(
         shifter = jnp.float32(SHIFTER) + 0.0 * n.astype(jnp.float32)
         slot = lax.rem(s, num_stages)
         kv_blk = kv_block_gmem[mh, qi, s]
+        if schedule:
+          # Ping-pong scheduling: only one tile runs its exp-heavy phase at a
+          # time, so the other tile's MMAs overlap it (FA3/FA4-style).
+          with jax.named_scope("sm_wait_turn"):
+            if t == 0:
+              @pl.when(s > 0)
+              def _():
+                plgpu.barrier_wait(turn.at[0])
+            else:
+              plgpu.barrier_wait(turn.at[1])
         with jax.named_scope("sm_wait_s"):
           plgpu.barrier_wait(s_ready.at[t])
         # PV_t(s-1) has completed (see module docstring): S_t may be
@@ -490,6 +503,8 @@ def splash_attention_forward_pingpong(
                  else jnp.exp2(x))
             ps.append(p)
           l_next = _tree(jnp.add, [l_prev * alpha] + [p.sum(axis=1) for p in ps])
+        if schedule:
+          plgpu.barrier_arrive(turn.at[1 - t])  # hand the turn to the other tile
         with jax.named_scope("sm_store_p"):
           for p, (c0, nc) in zip(ps, parts):
             plgpu.async_store_tmem(p_tmems[t].at[:, pl.ds(c0, nc)],
@@ -523,6 +538,10 @@ def splash_attention_forward_pingpong(
         @pl.when(n > 1)
         def _():  # observe the consumption of the last published alpha
           plgpu.barrier_wait(alpha_consumed.at[t])
+      if schedule and t == 0:
+        @pl.when(n > 0)
+        def _():  # observe tile 1's final hand-off
+          plgpu.barrier_wait(turn.at[0])
 
       def normalized_output():
         plgpu.barrier_wait(o_done)
@@ -613,6 +632,7 @@ def splash_attention_forward_pingpong(
       if correction else None,
       plgpu.Barrier(num_barriers=NUM_TILES, orders_tensor_core=True)
       if correction else None,
+      plgpu.Barrier(num_barriers=NUM_TILES) if schedule else None,
   ]
 
   def entry(*refs):
