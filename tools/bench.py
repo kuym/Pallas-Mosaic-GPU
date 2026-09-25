@@ -121,7 +121,9 @@ def run_all(configs, jsonl=None):
       record = dict(config, error=f"{type(e).__name__}: {e}"[:2000],
                     traceback=traceback.format_exc()[-4000:])
     record.update(gpu=os.environ.get("FARM_GPU"),
-                  job=os.environ.get("FARM_JOB_ID"), time=time.time())
+                  job=os.environ.get("FARM_JOB_ID"), time=time.time(),
+                  env={k: v for k, v in os.environ.items()
+                       if k.startswith("SPLASH_")})
     print(_describe(record), flush=True)
     if jsonl:
       with open(jsonl, "a") as f:  # one short line per write: append-safe

@@ -57,6 +57,26 @@ _ROWS = plgpu.Layout.TCGEN05.reduce(1)
 _COLS = plgpu.Layout.TCGEN05.reduce(0)
 
 
+# Cubic minimax fit of 2**f on [-0.5, 0.5]; max relative error 7.6e-5, far
+# below bf16 resolution (P is stored as bf16).
+_EXP2_COEFFS = (0.9999275516718514, 0.6932516151409869, 0.24261537603713018,
+                0.05522259924620865)
+
+
+def exp2_emulated(x):
+  """2**x for x <= 0 on the FMA pipe: split x = r + f, polynomial for 2**f,
+  then add r to the float exponent.  x is clamped at -125 (2**-125 ~ 2e-38)
+  so the exponent never underflows."""
+  x = jnp.maximum(x, -125.0)
+  r = lax.round(x, lax.RoundingMethod.TO_NEAREST_EVEN)
+  f = x - r
+  c0, c1, c2, c3 = _EXP2_COEFFS
+  p = c0 + f * (c1 + f * (c2 + f * c3))
+  bits = lax.bitcast_convert_type(p, jnp.int32) + lax.shift_left(
+      r.astype(jnp.int32), jnp.int32(23))
+  return lax.bitcast_convert_type(bits, jnp.float32)
+
+
 def _profile_params():
   """SPLASH_PROFILE_DIR=dir records a per-warp trace of the named scopes."""
   profile_dir = os.environ.get("SPLASH_PROFILE_DIR")
@@ -84,6 +104,7 @@ def splash_attention_forward_pingpong(
     save_residuals: bool,
     softmax_registers: int | None = None,
     producer_registers: int | None = None,
+    exp_emulation_cols: int | None = None,
     interpret: Any = None,
 ):
   batch, num_q_heads, q_seq_len, head_dim = q.shape
@@ -127,6 +148,13 @@ def splash_attention_forward_pingpong(
   q_heads_per_kv_head = num_q_heads // num_kv_heads
   mask_heads = num_steps.shape[0]
   serialize_pv = interpret is not None
+  if exp_emulation_cols is None:
+    exp_emulation_cols = int(os.environ.get("SPLASH_EXP_EMU_COLS", 0))
+  if exp_emulation_cols % 16 or not 0 <= exp_emulation_cols < bkv:
+    raise ValueError(f"exp_emulation_cols={exp_emulation_cols} must be a "
+                     f"multiple of 16 in [0, {bkv})")
+  parts = ([(0, exp_emulation_cols), (exp_emulation_cols, bkv - exp_emulation_cols)]
+           if exp_emulation_cols else [(0, bkv)])
   if num_steps.shape[1] != q_seq_len // CTA_ROWS:
     raise ValueError("mask info must be built with block_q=256")
 
@@ -280,28 +308,32 @@ def splash_attention_forward_pingpong(
       if has_segments:
         q_ids = plgpu.load(q_seg_smem.at[rows], layout=_ROWS)
 
-      def apply_masks(x, s, slot, kv_blk):
+      def apply_masks(x, s, slot, kv_blk, c0, nc, first_part):
+        """Masks columns [c0, c0 + nc) of the tile (x: [TILE, nc])."""
         is_partial = block_kind_gmem[mh, qi, s] == mask_info_lib.PARTIAL
+        cols = pl.ds(c0, nc)
         if has_dense_mask:
           def load_mask():
-            plgpu.barrier_wait(mask_barriers.at[slot])
-            m = plgpu.load(mask_smem.at[slot, rows],
+            if first_part:
+              plgpu.barrier_wait(mask_barriers.at[slot])
+            m = plgpu.load(mask_smem.at[slot, rows, cols],
                            layout=plgpu.Layout.TCGEN05)
             return _where(m != 0, x, mask_value)
           x = lax.cond(is_partial, load_mask, lambda: x)
         elif mask_function is not None:
           def compute_mask():
             q_pos = qi * CTA_ROWS + t * TILE + plgpu.broadcasted_iota(
-                jnp.int32, (TILE, bkv), 0, layout=plgpu.Layout.TCGEN05)
-            kv_pos = kv_blk * bkv + plgpu.broadcasted_iota(
-                jnp.int32, (TILE, bkv), 1, layout=plgpu.Layout.TCGEN05)
+                jnp.int32, (TILE, nc), 0, layout=plgpu.Layout.TCGEN05)
+            kv_pos = kv_blk * bkv + c0 + plgpu.broadcasted_iota(
+                jnp.int32, (TILE, nc), 1, layout=plgpu.Layout.TCGEN05)
             return _where(mask_function(q_pos, kv_pos), x, mask_value)
           x = lax.cond(is_partial, compute_mask, lambda: x)
         if has_segments:
-          plgpu.barrier_wait(seg_barriers.at[slot])
-          kv_ids = plgpu.load(kv_seg_smem.at[slot], layout=_COLS)
-          same = (lax.broadcast_in_dim(q_ids, (TILE, bkv), [0])
-                  == lax.broadcast_in_dim(kv_ids, (TILE, bkv), [1]))
+          if first_part:
+            plgpu.barrier_wait(seg_barriers.at[slot])
+          kv_ids = plgpu.load(kv_seg_smem.at[slot, cols], layout=_COLS)
+          same = (lax.broadcast_in_dim(q_ids, (TILE, nc), [0])
+                  == lax.broadcast_in_dim(kv_ids, (TILE, nc), [1]))
           x = _where(same, x, mask_value)
         return x
 
@@ -314,24 +346,38 @@ def splash_attention_forward_pingpong(
         # PV_t(s-1) has completed (see module docstring): S_t may be
         # overwritten with P_t and O_t may be rescaled.
         with jax.named_scope("sm_load_s"):
-          qk = plgpu.async_load_tmem(s_tmems[t])
+          qks = [plgpu.async_load_tmem(s_tmems[t].at[:, pl.ds(c0, nc)])
+                 for c0, nc in parts]
           plgpu.wait_load_tmem()
         with jax.named_scope("sm_mask"):
           if attn_logits_soft_cap is not None:
-            qk = jnp.tanh(qk / attn_logits_soft_cap) * attn_logits_soft_cap
-          qk = apply_masks(qk * LOG2E, s, slot, kv_blk)
+            qks = [jnp.tanh(x / attn_logits_soft_cap) * attn_logits_soft_cap
+                   for x in qks]
+          qks = [apply_masks(x * LOG2E, s, slot, kv_blk, c0, nc, i == 0)
+                 for i, (x, (c0, nc)) in enumerate(zip(qks, parts))]
           if has_aux:
             plgpu.commit_smem()  # Fence generic reads before TMA overwrites.
             plgpu.barrier_arrive(aux_consumed.at[slot])
         with jax.named_scope("sm_exp"):
-          m_curr = jnp.maximum(m_prev, qk.max(axis=1))
+          m_curr = m_prev
+          for x in qks:
+            m_curr = jnp.maximum(m_curr, x.max(axis=1))
           needs_rescale = m_curr - m_prev > RESCALE_THRESHOLD
           m_next = _where(needs_rescale, m_curr, m_prev)
           alpha = jnp.exp2(m_prev - m_next)
-          p = jnp.exp2(qk - lax.broadcast_in_dim(m_next, qk.shape, [0]))
-          l_next = l_prev * alpha + p.sum(axis=1)
+          l_next = l_prev * alpha
+          ps = []
+          for i, x in enumerate(qks):
+            x = x - lax.broadcast_in_dim(m_next, x.shape, [0])
+            # The first `exp_emulation_cols` columns use a polynomial on the
+            # FMA pipe, relieving the special-function unit (FA4's trick).
+            p = exp2_emulated(x) if (i == 0 and exp_emulation_cols) else jnp.exp2(x)
+            l_next = l_next + p.sum(axis=1)
+            ps.append(p)
         with jax.named_scope("sm_store_p"):
-          plgpu.async_store_tmem(p_tmems[t], p.astype(dtype))
+          for p, (c0, nc) in zip(ps, parts):
+            plgpu.async_store_tmem(p_tmems[t].at[:, pl.ds(c0, nc)],
+                                   p.astype(dtype))
 
         # Unlike the single-tile kernel, O is rescaled on every step (alpha is
         # exactly 1 for rows whose max did not move).  Skipping the rescale
