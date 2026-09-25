@@ -309,10 +309,15 @@ def splash_attention_forward_pingpong(
         alpha = jnp.exp2(m_prev - m_next)
         p = jnp.exp2(qk - lax.broadcast_in_dim(m_next, qk.shape, [0]))
         l_next = l_prev * alpha + p.sum(axis=1)
-        any_rescale = jnp.max(needs_rescale.astype(jnp.int32)) > 0
         plgpu.async_store_tmem(p_tmems[t], p.astype(dtype))
 
-        @pl.when(jnp.logical_and(s > 0, any_rescale))
+        # Unlike the single-tile kernel, O is rescaled on every step (alpha is
+        # exactly 1 for rows whose max did not move).  Skipping the rescale
+        # needs a warpgroup-wide "any row moved" scalar, i.e. a cross-warp
+        # reduction, and Mosaic GPU places every cross-warp reduction scratch
+        # at the same SMEM offset: the two softmax warpgroups would clobber
+        # each other (observed on B200: wrong results and deadlocks).
+        @pl.when(s > 0)
         def _rescale_o():
           o = plgpu.async_load_tmem(o_tmem.at[t])
           plgpu.wait_load_tmem()
