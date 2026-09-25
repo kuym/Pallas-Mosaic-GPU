@@ -170,7 +170,7 @@ def splash_attention_forward_pingpong(
   if correction is None:
     correction = os.environ.get("SPLASH_CORRECTION", "0") == "1"
   if schedule is None:
-    schedule = os.environ.get("SPLASH_SCHEDULE", "1") == "1"
+    schedule = os.environ.get("SPLASH_SCHEDULE", "0") == "1"
   correction_registers = 64
   env_regs = os.environ.get("SPLASH_PP_REGS")
   if env_regs:

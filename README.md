@@ -203,7 +203,7 @@ noted:
 | Softmax over 2–8 independent column slices (shorter max/sum chains) | −2% to −39%. ptxas already hides the chains |
 | Correction warpgroup that rescales O off the softmax path | +3% (full D=128), −3 to −16% elsewhere. Off by default |
 | Unmasked-block fast path (log2e folded into the exp2 FMA) | −1% to +5% (D=64). On by default |
-| Scheduling token so the two tiles' softmax phases alternate | +2% (full), −3 to −20% elsewhere. On by default, to be revisited |
+| Scheduling token so the two tiles' softmax phases alternate | +2% (full), −3 to −20% elsewhere. Off by default |
 
 Ablations, with deliberately wrong results, show where the time goes. At full
 S=16K D=128 the kernel does 1,087 TFLOP/s. Without the O rescale it does 1,217.
