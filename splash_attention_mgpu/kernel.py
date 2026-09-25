@@ -79,7 +79,7 @@ class BlockSizes:
   num_stages_bwd: depth of the backward kernels' SMEM rings.
   """
 
-  block_q: int = BLOCK_Q
+  block_q: int | None = None  # None: choose 128 or 256 per call (see below)
   block_kv: int = 128
   num_stages: int = 2
   block_kv_dq: int = 64
@@ -87,9 +87,10 @@ class BlockSizes:
   num_stages_bwd: int = 2
 
   def __post_init__(self):
-    if self.block_q not in (BLOCK_Q, 2 * BLOCK_Q):
-      # 256 selects the two-tile ping-pong forward kernel.
-      raise ValueError(f"block_q must be 128 or 256, got {self.block_q}")
+    if self.block_q not in (None, BLOCK_Q, 2 * BLOCK_Q):
+      # 256 selects the two-tile ping-pong forward kernel; None picks it
+      # automatically where it is faster (head_dim 128, little extra work).
+      raise ValueError(f"block_q must be None, 128 or 256, got {self.block_q}")
     if self.block_kv not in (64, 128):
       # Two f32 S buffers of 256 columns would fill all of TMEM.
       raise ValueError(f"block_kv must be 64 or 128, got {self.block_kv}")

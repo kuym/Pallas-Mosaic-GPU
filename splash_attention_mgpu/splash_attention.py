@@ -29,6 +29,13 @@ from . import mask_info as mask_info_lib
 from .kernel import DEFAULT_MASK_VALUE, BlockSizes, SegmentIds
 
 
+# Automatic block_q: the two-tile kernel is used for head_dim 128 when its
+# 256-row schedule visits at most this much more KV-block work than the
+# 128-row one (measured on B200: +16-28% for full/causal/chunked masks,
+# slower for narrow local windows and at head_dim 64).
+AUTO_PINGPONG_MAX_EXTRA_WORK = 1.10
+
+
 class SplashAttentionKernel:
   """Callable holding the processed mask.
 
@@ -41,33 +48,21 @@ class SplashAttentionKernel:
       self,
       info: mask_info_lib.GpuMaskInfo,
       *,
-      fwd_info: mask_info_lib.GpuMaskInfo | None = None,
+      fwd_infos: dict[int, mask_info_lib.GpuMaskInfo],
       is_mqa: bool,
       block_sizes: BlockSizes,
       mask_value: float,
       attn_logits_soft_cap: float | None,
       interpret: Any,
   ):
-    # `info` has 128-row granularity (backward kernels, FLOP accounting);
-    # `fwd_info` matches block_sizes.block_q (the forward kernel).
+    # `info` has 128x128 granularity (backward kernels, FLOP accounting);
+    # `fwd_infos[block_q]` is the forward schedule for each candidate block_q.
     self.info = info
-    self.fwd_info = fwd_info = fwd_info or info
+    self.fwd_infos = fwd_infos
     self.is_mqa = is_mqa
-    self.static = _Static(
-        mask_function=info.mask_function,
-        block_sizes=block_sizes,
-        mask_value=mask_value,
-        attn_logits_soft_cap=attn_logits_soft_cap,
-        interpret=interpret,
-    )
+    self.requested_block_sizes = block_sizes
     to_dev = lambda x: None if x is None else jnp.asarray(x)
-    self.schedule = _Schedule(
-        fwd_num_steps=to_dev(fwd_info.num_steps),
-        fwd_q_block_order=to_dev(fwd_info.q_block_order),
-        fwd_kv_block=to_dev(fwd_info.kv_block),
-        fwd_block_kind=to_dev(fwd_info.block_kind),
-        fwd_mask_block=to_dev(fwd_info.mask_block),
-        fwd_partial_mask_blocks=to_dev(fwd_info.partial_mask_blocks),
+    bwd = dict(
         num_steps=to_dev(info.num_steps),
         q_block_order=to_dev(info.q_block_order),
         kv_block=to_dev(info.kv_block),
@@ -81,10 +76,45 @@ class SplashAttentionKernel:
         dkv_mask_block=to_dev(info.dkv_mask_block),
         partial_mask_blocks_t=to_dev(info.partial_mask_blocks_t),
     )
+    self._variants = {}
+    for bq, fwd in fwd_infos.items():
+      static = _Static(
+          mask_function=info.mask_function,
+          block_sizes=dataclasses.replace(block_sizes, block_q=bq),
+          mask_value=mask_value,
+          attn_logits_soft_cap=attn_logits_soft_cap,
+          interpret=interpret,
+      )
+      schedule = _Schedule(
+          fwd_num_steps=to_dev(fwd.num_steps),
+          fwd_q_block_order=to_dev(fwd.q_block_order),
+          fwd_kv_block=to_dev(fwd.kv_block),
+          fwd_block_kind=to_dev(fwd.block_kind),
+          fwd_mask_block=to_dev(fwd.mask_block),
+          fwd_partial_mask_blocks=to_dev(fwd.partial_mask_blocks),
+          **bwd,
+      )
+      self._variants[bq] = (static, schedule)
+    # Extra KV-block work of the 256-row schedule relative to the 128-row one.
+    self.pingpong_extra_work = None
+    if 256 in fwd_infos and 128 in fwd_infos:
+      self.pingpong_extra_work = (
+          float(fwd_infos[256].num_steps.sum()) * 256
+          / max(1.0, float(fwd_infos[128].num_steps.sum()) * 128))
+
+  def choose_block_q(self, head_dim: int, head_dim_v: int) -> int:
+    requested = self.requested_block_sizes.block_q
+    if requested is not None:
+      return requested
+    if (256 in self._variants and head_dim == head_dim_v == 128
+        and self.pingpong_extra_work is not None
+        and self.pingpong_extra_work <= AUTO_PINGPONG_MAX_EXTRA_WORK):
+      return 256
+    return 128
 
   @property
   def block_sizes(self) -> BlockSizes:
-    return self.static.block_sizes
+    return self.requested_block_sizes
 
   def __call__(
       self,
@@ -95,9 +125,11 @@ class SplashAttentionKernel:
       *,
       save_residuals: bool = False,
   ):
+    static, schedule = self._variants[
+        self.choose_block_q(q.shape[-1], v.shape[-1])]
     return _splash_attention(
-        q, k, v, segment_ids, self.schedule,
-        is_mqa=self.is_mqa, static=self.static, save_residuals=save_residuals,
+        q, k, v, segment_ids, schedule,
+        is_mqa=self.is_mqa, static=static, save_residuals=save_residuals,
     )
 
 
@@ -253,15 +285,22 @@ def _make_splash_attention(
         [mask_lib.NumpyMask(m) for m in mask]
     )
   # The backward kernels (and FLOP accounting) always use a 128x128 schedule;
-  # the forward kernel uses (block_q, block_kv).
+  # the forward kernel uses (block_q, block_kv) for each candidate block_q.
   info = mask_info_lib.process_mask(mask, (128, 128))
-  fwd_info = None
-  if (block_sizes.block_q, block_sizes.block_kv) != (128, 128):
-    fwd_info = mask_info_lib.process_mask(
-        mask, (block_sizes.block_q, block_sizes.block_kv))
+  q_len = mask.shape[1]
+  if block_sizes.block_q is not None:
+    candidates = [block_sizes.block_q]
+  else:
+    candidates = [128] + ([256] if q_len % 256 == 0 else [])
+  fwd_infos = {}
+  for bq in candidates:
+    if (bq, block_sizes.block_kv) == (128, 128):
+      fwd_infos[bq] = info
+    else:
+      fwd_infos[bq] = mask_info_lib.process_mask(mask, (bq, block_sizes.block_kv))
   return SplashAttentionKernel(
       info,
-      fwd_info=fwd_info,
+      fwd_infos=fwd_infos,
       is_mqa=is_mqa,
       block_sizes=block_sizes,
       mask_value=mask_value,

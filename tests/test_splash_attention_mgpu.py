@@ -532,3 +532,17 @@ def test_exp2_emulated():
   np.testing.assert_allclose(got, want, rtol=1e-4)
   assert np.all(np.asarray(exp2_emulated(jnp.float32(-1e30),
                                          jnp.float32(SHIFTER))) < 1e-37)
+
+
+def test_auto_block_q_selection():
+  s = 4096
+  pick = lambda m, d: sa.make_splash_mha(m).choose_block_q(d, d)
+  assert pick(sa.FullMask((s, s)), 128) == 256
+  assert pick(sa.CausalMask((s, s)), 128) == 256
+  assert pick(sa.ChunkedCausalMask((s, s), 2048), 128) == 256
+  assert pick(sa.LocalMask((s, s), (1024, 0), 0), 128) == 128  # extra work
+  assert pick(sa.FullMask((s, s)), 64) == 128
+  assert pick(sa.FullMask((384, 384)), 128) == 128  # not a multiple of 256
+  assert sa.make_splash_mha(sa.FullMask((s, s)),
+                            block_sizes=sa.BlockSizes(block_q=128)
+                            ).choose_block_q(128, 128) == 128
