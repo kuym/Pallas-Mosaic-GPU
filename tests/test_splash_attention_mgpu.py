@@ -587,3 +587,27 @@ def test_interpret_grads_fused(kwargs):
 def test_gpu_grads_fused(kwargs):
   kwargs = dict(kwargs)
   _check_grads(kwargs.pop("mask_name"), s=2048, **kwargs)
+
+
+GRAD_CASES_D64_FUSED = [
+    dict(mask_name="full"),
+    dict(mask_name="causal"),
+    dict(mask_name="local", segments=True),
+    dict(mask_name="dense", segments=True),
+    dict(mask_name="causal", h=4, kvh=2),
+    dict(mask_name="causal", cap=5.0, b=2),
+]
+
+
+@pytest.mark.parametrize("kwargs", GRAD_CASES_D64_FUSED, ids=_case_id)
+def test_interpret_grads_fused_d64(kwargs):
+  # head_dim 64 uses the fused backward's dQ = dS K formulation.
+  kwargs = dict(kwargs)
+  _check_grads(kwargs.pop("mask_name"), interpret=INTERPRET, **kwargs)
+
+
+@needs_blackwell
+@pytest.mark.parametrize("kwargs", GRAD_CASES_D64_FUSED, ids=_case_id)
+def test_gpu_grads_fused_d64(kwargs):
+  kwargs = dict(kwargs)
+  _check_grads(kwargs.pop("mask_name"), s=2048, **kwargs)

@@ -297,6 +297,11 @@ def _attention_bwd(static, residuals, do):
       interpret=static.interpret,
   )
   if (backward_fused.fused_supported(q.shape[-1], v.shape[-1])
+      and backward_fused.fused_fits(
+          head_dim=q.shape[-1], num_stages=bs.num_stages_bwd,
+          itemsize=jnp.dtype(q.dtype).itemsize,
+          has_dense_mask=schedule.partial_mask_blocks_t is not None,
+          has_segments=segment_ids is not None)
       and os.environ.get("SPLASH_BWD_FUSED", "1") == "1"):
     dq, dk, dv = backward_fused.splash_attention_bwd_fused(
         q, k, v, do, lse, delta, segment_ids,

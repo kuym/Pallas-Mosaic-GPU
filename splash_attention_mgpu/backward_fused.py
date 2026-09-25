@@ -15,8 +15,8 @@ group, computing P and dS once per (q sub-block, KV block):
              accumulator laid out [batch, heads, head_dim, q] (so no
              transpose is needed in-kernel); XLA transposes and casts once.
 
-TMEM: S^T/P^T (bc) + dP^T/dS^T (bc) + dK (128) + dV (128) + dQ^T (bc) columns
-= 448 at bc = 64.
+TMEM: S^T/P^T (bc) + dP^T/dS^T (bc) + dK + dV + dQ(^T) columns = 448 at
+head_dim 128 (bc = 64, dQ^T) and at head_dim 64 (bc = 128, dQ = dS K).
 """
 
 from __future__ import annotations
@@ -39,11 +39,26 @@ from .backward import (
     _num_elementwise_wgs,
     _probs_and_dlogits,
 )
-from .kernel import SegmentIds, _swizzle_transforms, _where
+from .kernel import SMEM_BYTES, SegmentIds, _swizzle_transforms, _where
 
 
 def fused_supported(head_dim, head_dim_v, block_kv=128):
-  return head_dim == head_dim_v == 128 and block_kv == 128
+  return head_dim == head_dim_v and head_dim in (64, 128) and block_kv == 128
+
+
+def fused_smem_bytes(*, head_dim, num_stages, itemsize, has_dense_mask,
+                     has_segments, block_kv=128):
+  bc = 64 if head_dim == 128 else 128
+  return (block_kv * 2 * head_dim * itemsize
+          + num_stages * bc * (2 * head_dim * itemsize + 8)
+          + (num_stages * block_kv * bc if has_dense_mask else 0)
+          + (block_kv + num_stages * bc) * 4 * has_segments
+          + block_kv * bc * itemsize  # dS^T for the dQ MMA
+          + head_dim * bc * 4)  # dQ(^T) staging
+
+
+def fused_fits(**kwargs) -> bool:
+  return fused_smem_bytes(**kwargs) <= SMEM_BYTES
 
 
 def splash_attention_bwd_fused(
@@ -64,10 +79,16 @@ def splash_attention_bwd_fused(
   _, num_kv_heads, kv_seq_len, head_dim_v = v.shape
   dtype = q.dtype
   bq = 128
-  bc = 64  # q rows per step (TMEM budget, see module docstring)
   bkv = block_kv
   if not fused_supported(head_dim, head_dim_v, bkv):
-    raise NotImplementedError("fused backward needs head_dim 128, block_kv 128")
+    raise NotImplementedError(
+        "fused backward needs head_dim == head_dim_v in (64, 128), block_kv 128")
+  # dQ formulation.  head_dim 128: 64-row q steps and dQ^T = K^T dS^T (M =
+  # head_dim; accumulator [B, H, D, Sq]).  head_dim 64: M = 64 MMAs are not
+  # usable here, so 128-row q steps and dQ = dS K with A = dS^T in SMEM read
+  # transposed (M = 128; accumulator [B, H, Sq, D]).
+  dq_transposed = head_dim == 128
+  bc = 64 if dq_transposed else 128  # q rows per step
   sub = bq // bc
   itemsize = jnp.dtype(dtype).itemsize
   has_dense_mask = partial_mask_blocks_t is not None
@@ -77,15 +98,12 @@ def splash_attention_bwd_fused(
   w = bc // ne
   _check_budgets(
       "fused backward kernel",
-      tmem_cols=2 * bc + head_dim + head_dim_v + bc,
-      smem_bytes=(
-          bkv * (head_dim + head_dim_v) * itemsize
-          + num_stages * bc * ((head_dim + head_dim_v) * itemsize + 8)
-          + (num_stages * bkv * bc if has_dense_mask else 0)
-          + (bkv + num_stages * bc) * 4 * has_segments
-          + bkv * bc * itemsize  # dS^T for the dQ MMA
-          + head_dim * bc * 4  # dQ^T staging
-      ),
+      tmem_cols=2 * bc + head_dim + head_dim_v + (bc if dq_transposed
+                                                    else head_dim),
+      smem_bytes=fused_smem_bytes(
+          head_dim=head_dim, num_stages=num_stages, itemsize=itemsize,
+          has_dense_mask=has_dense_mask, has_segments=has_segments,
+          block_kv=bkv),
   )
   group = num_q_heads // num_kv_heads
   mask_heads = num_steps.shape[0]
@@ -234,9 +252,12 @@ def splash_attention_bwd_fused(
             def _():  # the dQ writer has read dQ^T(t-1)
               with jax.named_scope("mma_wait_dq_free"):
                 plgpu.barrier_wait(dq_free)
-            for e in range(ne):  # dQ^T[:, e*w:(e+1)*w] = K^T dS^T_e
-              plgpu.tcgen05_mma(dqt_tmem.at[:, pl.ds(e * w, w)], k_smem.T,
-                                ds_smem.at[e], accumulate=False)
+            if dq_transposed:
+              for e in range(ne):  # dQ^T[:, e*w:(e+1)*w] = K^T dS^T_e
+                plgpu.tcgen05_mma(dqt_tmem.at[:, pl.ds(e * w, w)], k_smem.T,
+                                  ds_smem.at[e], accumulate=False)
+            else:  # dQ = dS K, dS read as the transpose of dS^T
+              plgpu.tcgen05_mma(dqt_tmem, ds_smem.T, k_smem, accumulate=False)
             plgpu.tcgen05_commit_arrive(dq_ready)
             # Releases the slot once every MMA reading Q / dO has completed.
             plgpu.tcgen05_commit_arrive(consumed.at[slot])
@@ -311,7 +332,10 @@ def splash_attention_bwd_fused(
           ds16 = ds_t.astype(dtype)
           plgpu.async_store_tmem(pt_tmem.at[:, cols], p_t.astype(dtype))
           plgpu.async_store_tmem(dst_tmem.at[:, cols], ds16)
-          ds_smem[e] = ds16  # B operand of the dQ^T MMA
+          if dq_transposed:
+            ds_smem[e] = ds16  # B operand of the dQ^T MMA
+          else:
+            ds_smem[:, cols] = ds16  # A operand (transposed) of the dQ MMA
           plgpu.commit_tmem()
           plgpu.commit_smem()  # dS^T for the async proxy; fences our reads
         plgpu.barrier_arrive(aux_consumed.at[slot])
@@ -349,10 +373,11 @@ def splash_attention_bwd_fused(
       def write(t, h, mh, u):
         del t
         _, row0, _ = step_rows(mh, u)
-        if serialize_mma:  # interpret: a private slice per CTA (see below)
-          dst = dq_acc.at[lax.axis_index("kv"), b, h, :, pl.ds(row0, bc)]
+        acc = dq_acc.at[lax.axis_index("kv")] if serialize_mma else dq_acc
+        if dq_transposed:
+          dst = acc.at[b, h, :, pl.ds(row0, bc)]
         else:
-          dst = dq_acc.at[b, h, :, pl.ds(row0, bc)]
+          dst = acc.at[b, h, pl.ds(row0, bc), :]
         with jax.named_scope("dq_wait"):
           plgpu.barrier_wait(dq_ready)
         dqt = plgpu.async_load_tmem(dqt_tmem)
@@ -375,7 +400,7 @@ def splash_attention_bwd_fused(
       plgpu.wait_smem_to_gmem(0)
 
   qk_t = _swizzle_transforms(head_dim, dtype)
-  ds_t = _swizzle_transforms(w, dtype)
+  ds_t = _swizzle_transforms(w if dq_transposed else bc, dtype)
   scratch_types = [
       plgpu.SMEM((bkv, head_dim), dtype, transforms=qk_t),
       plgpu.SMEM((bkv, head_dim_v), dtype, transforms=qk_t),
@@ -386,8 +411,10 @@ def splash_attention_bwd_fused(
       plgpu.SMEM((bkv,), jnp.int32) if has_segments else None,
       plgpu.SMEM((num_stages, bc), jnp.int32) if has_segments else None,
       plgpu.SMEM((num_stages, bkv, bc), jnp.int8) if has_dense_mask else None,
-      plgpu.SMEM((ne, bkv, w), dtype, transforms=ds_t),
-      plgpu.SMEM((head_dim, bc), jnp.float32),
+      plgpu.SMEM((ne, bkv, w) if dq_transposed else (bkv, bc), dtype,
+                 transforms=ds_t),
+      plgpu.SMEM((head_dim, bc) if dq_transposed else (bc, head_dim),
+                 jnp.float32),
       None,
       plgpu.RefUnion(plgpu.TMEM((bkv, bc), jnp.float32),
                      plgpu.TMEM((bkv, bc), dtype, packed=True)),
@@ -395,7 +422,8 @@ def splash_attention_bwd_fused(
                      plgpu.TMEM((bkv, bc), dtype, packed=True)),
       plgpu.TMEM((bkv, head_dim), jnp.float32),
       plgpu.TMEM((bkv, head_dim_v), jnp.float32),
-      plgpu.TMEM((head_dim, bc), jnp.float32),
+      plgpu.TMEM((head_dim, bc) if dq_transposed else (bc, head_dim),
+                 jnp.float32),
       plgpu.Barrier(num_arrivals=2 + has_segments),
       plgpu.Barrier(num_arrivals=4 + has_segments, num_barriers=num_stages),
       plgpu.Barrier(num_barriers=num_stages) if has_dense_mask else None,
@@ -417,7 +445,8 @@ def splash_attention_bwd_fused(
   inputs += [num_steps, kv_block_order, q_block, block_kind]
   if has_dense_mask:
     inputs += [mask_block, partial_mask_blocks_t]
-  acc_shape = (batch, num_q_heads, head_dim, q_seq_len)
+  acc_shape = ((batch, num_q_heads, head_dim, q_seq_len) if dq_transposed
+               else (batch, num_q_heads, q_seq_len, head_dim))
   if serialize_mma:
     acc_shape = (kv_seq_len // bkv,) + acc_shape  # interpret: per-CTA partials
   dq_acc = jax.new_ref(jnp.zeros(acc_shape, jnp.float32))
@@ -433,5 +462,7 @@ def splash_attention_bwd_fused(
   dq = dq_acc[...]
   if serialize_mma:
     dq = dq.sum(axis=0)
-  dq = jnp.swapaxes(dq, 2, 3).astype(dtype)
+  if dq_transposed:
+    dq = jnp.swapaxes(dq, 2, 3)
+  dq = dq.astype(dtype)
   return dq, dk, dv
