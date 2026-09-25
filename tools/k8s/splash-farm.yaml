@@ -15,7 +15,7 @@ spec:
         - {name: DEBIAN_FRONTEND, value: noninteractive}
       resources:
         limits: {nvidia.com/gpu: 8}
-        requests: {nvidia.com/gpu: 8, cpu: "140", memory: 1200Gi}
+        requests: {nvidia.com/gpu: 8, cpu: "120", memory: 1200Gi}
       volumeMounts:
         - {name: dshm, mountPath: /dev/shm}
   volumes:
