@@ -46,9 +46,8 @@ def draw(seed):
       mask=r.choice(["full", "causal", "local", "chunked", "dense"]),
       block_sizes=dict(
           block_kv=block_kv, num_stages=r.choice([2, 2, 3]),
-          block_kv_dq=r.choice([32, 64, 128]),
-          block_q_dkv=r.choice([32, 64]) if head_dim == 128 else
-          r.choice([32, 64, 128]),
+          block_kv_dq=r.choice([64, 128]),
+          block_q_dkv=64 if head_dim == 128 else r.choice([64, 128]),
           num_stages_bwd=r.choice([1, 2, 3])),
   )
   if case["block_sizes"]["block_kv_dq"] > block_kv:

@@ -96,10 +96,14 @@ class BlockSizes:
       # QK of step s+1 is issued before PV of step s, so the K/V ring must
       # hold two steps or the pipeline deadlocks.
       raise ValueError(f"num_stages must be >= 2, got {self.num_stages}")
-    if self.block_kv_dq not in (32, 64, 128) or self.block_kv % self.block_kv_dq:
-      raise ValueError(f"block_kv_dq={self.block_kv_dq} must divide block_kv")
-    if self.block_q_dkv not in (32, 64, 128):
-      raise ValueError(f"block_q_dkv must be 32, 64 or 128")
+    # The backward kernels contract over these sub-block sizes, and tcgen05
+    # needs 16-bit contraction dims in multiples of 64.
+    if self.block_kv_dq not in (64, 128) or self.block_kv % self.block_kv_dq:
+      raise ValueError(
+          f"block_kv_dq={self.block_kv_dq} must be 64 or 128 and divide"
+          " block_kv")
+    if self.block_q_dkv not in (64, 128):
+      raise ValueError(f"block_q_dkv={self.block_q_dkv} must be 64 or 128")
     if self.num_stages_bwd < 1:
       raise ValueError("num_stages_bwd must be >= 1")
 

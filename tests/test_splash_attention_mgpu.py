@@ -264,6 +264,8 @@ def test_rejects_invalid_block_sizes():
     sa.BlockSizes(num_stages=1)
   with pytest.raises(ValueError, match="block_kv"):
     sa.BlockSizes(block_kv=256)
+  with pytest.raises(ValueError, match="block_q_dkv"):
+    sa.BlockSizes(block_q_dkv=32)  # tcgen05 contraction dim must be >= 64
 
 
 def test_rejects_oversized_configs():
@@ -407,10 +409,10 @@ GRAD_CASES = [
     dict(mask_name="causal", dtype=jnp.float16),
     dict(mask_name="causal", multi_head_mask=True, h=3),
     dict(mask_name="causal",
-         block_sizes=sa.BlockSizes(block_kv_dq=128, block_q_dkv=32,
+         block_sizes=sa.BlockSizes(block_kv_dq=128, block_q_dkv=64,
                                    num_stages_bwd=1)),
     dict(mask_name="dense",
-         block_sizes=sa.BlockSizes(block_kv_dq=32, block_q_dkv=128,
+         block_sizes=sa.BlockSizes(block_kv_dq=64, block_q_dkv=128,
                                    num_stages_bwd=3)),
 ]
 _case_id = lambda kw: ",".join(f"{k}={v}" for k, v in kw.items())

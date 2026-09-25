@@ -36,7 +36,8 @@ def configs(quick=False):
     for bkv, st in itertools.product([64, 128], [2, 3, 4]):
       out.append(dict(base, block_kv=bkv, num_stages=st))
     if d <= 128:
-      for dq, dkv, st in itertools.product([32, 64, 128], [32, 64], [1, 2, 3]):
+      dkv_sizes = [64, 128] if d <= 64 else [64]  # 128 exceeds TMEM at d=128
+      for dq, dkv, st in itertools.product([64, 128], dkv_sizes, [1, 2, 3]):
         out.append(dict(base, backward=True, block_kv_dq=dq, block_q_dkv=dkv,
                         num_stages_bwd=st))
   return out
