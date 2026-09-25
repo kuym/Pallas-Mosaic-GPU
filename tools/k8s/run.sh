@@ -27,15 +27,19 @@ upload() {
 
 case "${1:-}" in
   kubeconfig)
+    # $2 = cluster name.  The list endpoint omits the kubeconfig; the
+    # per-cluster endpoint returns it base64-encoded.
     key="${TOGETHER_API_KEY:-$(cat ~/.together/api_key)}"
-    curl -fsS -m 60 -H "Authorization: Bearer $key" \
-        https://api.together.ai/v1/compute/clusters |
+    api=https://api.together.ai/v1/compute/clusters
+    id=$(curl -fsS -m 60 -H "Authorization: Bearer $key" "$api" |
       python3 -c 'import sys, json
-c = [c for c in json.load(sys.stdin)["clusters"] if c["cluster_name"] == sys.argv[1]][0]
-assert c["kube_config"], "cluster has no kubeconfig yet (status %s)" % c["status"]
-sys.stdout.write(c["kube_config"])' "$2" > kubeconfig
-    chmod 600 kubeconfig
-    "${K[@]}" get nodes -o wide
+print([c for c in json.load(sys.stdin)["clusters"] if c["cluster_name"] == sys.argv[1]][0]["cluster_id"])' "$2")
+    (umask 077; curl -fsS -m 60 -H "Authorization: Bearer $key" "$api/$id" |
+      python3 -c 'import sys, json, base64
+c = json.load(sys.stdin); c = c.get("cluster", c)
+assert c.get("kube_config"), "no kubeconfig yet (status %s)" % c["status"]
+sys.stdout.write(base64.b64decode(c["kube_config"]).decode())' > kubeconfig)
+    "${K[@]}" get nodes
     ;;
   up)
     "${K[@]}" apply -f tools/k8s/splash-farm.yaml
