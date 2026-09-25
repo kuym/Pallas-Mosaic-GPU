@@ -22,12 +22,19 @@ q, k, v = (jax.random.normal(jax.random.key(i), (2, seq, d), jnp.bfloat16) for i
 g = jax.grad(lambda q, k, v: kern(q, k, v).astype(jnp.float32).sum(), argnums=(0, 1, 2))
 jax.block_until_ready(g(q, k, v))
 time.sleep(3)
-warps = 4 * (ne + 1)
-roles = {**{w: f"ew{w // 4}" for w in range(4 * ne)}, 4 * ne: "tma", 4 * ne + 1: "mma"}
 for f in sorted(glob.glob(os.path.join(out_dir, "*trace.json"))):
   trace = json.load(open(f))["traceEvents"]
   names = {e["name"] for e in trace}
-  kind = "dkv" if "mma_wait_q" in names else ("dq" if "mma_wait_ds" in names else "fwd")
+  if "dq_wait" in names:
+    kind = "fused"
+    warps = 4 * (ne + 2)
+    roles = {**{w: f"ew{w // 4}" for w in range(4 * ne)},
+             **{w: "dq_writer" for w in range(4 * ne, 4 * ne + 4)},
+             4 * ne + 4: "tma", 4 * ne + 5: "mma"}
+  else:
+    kind = "dkv" if "mma_wait_q" in names else ("dq" if "mma_wait_ds" in names else "fwd")
+    warps = 4 * (ne + 1)
+    roles = {**{w: f"ew{w // 4}" for w in range(4 * ne)}, 4 * ne: "tma", 4 * ne + 1: "mma"}
   tot = collections.defaultdict(float); cnt = collections.Counter(); open_ = {}
   span = collections.defaultdict(lambda: [float("inf"), float("-inf")])
   for e in trace:
