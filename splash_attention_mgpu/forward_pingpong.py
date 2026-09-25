@@ -57,6 +57,19 @@ _ROWS = plgpu.Layout.TCGEN05.reduce(1)
 _COLS = plgpu.Layout.TCGEN05.reduce(0)
 
 
+def _profile_params():
+  """SPLASH_PROFILE_DIR=dir records a per-warp trace of the named scopes."""
+  profile_dir = os.environ.get("SPLASH_PROFILE_DIR")
+  if not profile_dir:
+    return {}
+  # The profiler buffers events in SMEM, so the space is small; bounds
+  # checking truncates the trace instead of corrupting memory.
+  return dict(profile_space=int(os.environ.get("SPLASH_PROFILE_SPACE", 256)),
+              profile_dir=profile_dir,
+              profile_trace_scope=plgpu.TraceScope.WARP,
+              profile_bounds_check=True)
+
+
 def splash_attention_forward_pingpong(
     q, k, v,
     segment_ids: SegmentIds | None,
@@ -169,9 +182,10 @@ def splash_attention_forward_pingpong(
 
             @pl.when(s >= num_stages)
             def _():
-              plgpu.barrier_wait(kv_consumed.at[slot])
-              if has_aux:
-                plgpu.barrier_wait(aux_consumed.at[slot])
+              with jax.named_scope("tma_wait_slot"):
+                plgpu.barrier_wait(kv_consumed.at[slot])
+                if has_aux:
+                  plgpu.barrier_wait(aux_consumed.at[slot])
 
             kv_slice = pl.ds(kv_block_gmem[mh, qi, s] * bkv, bkv)
             plgpu.copy_gmem_to_smem(k_gmem.at[b, kv_head, kv_slice],
@@ -214,7 +228,8 @@ def splash_attention_forward_pingpong(
 
           def issue_pv(t, s):
             slot = lax.rem(s, num_stages)
-            plgpu.barrier_wait(p_ready.at[t])
+            with jax.named_scope(f"mma_wait_p{t}"):
+              plgpu.barrier_wait(p_ready.at[t])
             plgpu.tcgen05_mma(o_tmem.at[t], p_tmems[t], v_smem.at[slot],
                               accumulate=s > 0)
             if serialize_pv:
@@ -232,12 +247,14 @@ def splash_attention_forward_pingpong(
           def _mma_loop(s):
             slot = lax.rem(s, num_stages)
             has_next = s + 1 < n
-            plgpu.barrier_wait(v_barriers.at[slot])
+            with jax.named_scope("mma_wait_v"):
+              plgpu.barrier_wait(v_barriers.at[slot])
             issue_pv(0, s)
 
             @pl.when(has_next)
             def _():
-              plgpu.barrier_wait(k_barriers.at[lax.rem(s + 1, num_stages)])
+              with jax.named_scope("mma_wait_k"):
+                plgpu.barrier_wait(k_barriers.at[lax.rem(s + 1, num_stages)])
               issue_s(0, s + 1)
 
             issue_pv(1, s)
@@ -292,24 +309,29 @@ def splash_attention_forward_pingpong(
         m_prev, l_prev = carry
         slot = lax.rem(s, num_stages)
         kv_blk = kv_block_gmem[mh, qi, s]
-        plgpu.barrier_wait(s_ready.at[t])
+        with jax.named_scope("sm_wait_s"):
+          plgpu.barrier_wait(s_ready.at[t])
         # PV_t(s-1) has completed (see module docstring): S_t may be
         # overwritten with P_t and O_t may be rescaled.
-        qk = plgpu.async_load_tmem(s_tmems[t])
-        plgpu.wait_load_tmem()
-        if attn_logits_soft_cap is not None:
-          qk = jnp.tanh(qk / attn_logits_soft_cap) * attn_logits_soft_cap
-        qk = apply_masks(qk * LOG2E, s, slot, kv_blk)
-        if has_aux:
-          plgpu.commit_smem()  # Fence generic reads before TMA overwrites.
-          plgpu.barrier_arrive(aux_consumed.at[slot])
-        m_curr = jnp.maximum(m_prev, qk.max(axis=1))
-        needs_rescale = m_curr - m_prev > RESCALE_THRESHOLD
-        m_next = _where(needs_rescale, m_curr, m_prev)
-        alpha = jnp.exp2(m_prev - m_next)
-        p = jnp.exp2(qk - lax.broadcast_in_dim(m_next, qk.shape, [0]))
-        l_next = l_prev * alpha + p.sum(axis=1)
-        plgpu.async_store_tmem(p_tmems[t], p.astype(dtype))
+        with jax.named_scope("sm_load_s"):
+          qk = plgpu.async_load_tmem(s_tmems[t])
+          plgpu.wait_load_tmem()
+        with jax.named_scope("sm_mask"):
+          if attn_logits_soft_cap is not None:
+            qk = jnp.tanh(qk / attn_logits_soft_cap) * attn_logits_soft_cap
+          qk = apply_masks(qk * LOG2E, s, slot, kv_blk)
+          if has_aux:
+            plgpu.commit_smem()  # Fence generic reads before TMA overwrites.
+            plgpu.barrier_arrive(aux_consumed.at[slot])
+        with jax.named_scope("sm_exp"):
+          m_curr = jnp.maximum(m_prev, qk.max(axis=1))
+          needs_rescale = m_curr - m_prev > RESCALE_THRESHOLD
+          m_next = _where(needs_rescale, m_curr, m_prev)
+          alpha = jnp.exp2(m_prev - m_next)
+          p = jnp.exp2(qk - lax.broadcast_in_dim(m_next, qk.shape, [0]))
+          l_next = l_prev * alpha + p.sum(axis=1)
+        with jax.named_scope("sm_store_p"):
+          plgpu.async_store_tmem(p_tmems[t], p.astype(dtype))
 
         # Unlike the single-tile kernel, O is rescaled on every step (alpha is
         # exactly 1 for rows whose max did not move).  Skipping the rescale
@@ -319,13 +341,15 @@ def splash_attention_forward_pingpong(
         # each other (observed on B200: wrong results and deadlocks).
         @pl.when(s > 0)
         def _rescale_o():
-          o = plgpu.async_load_tmem(o_tmem.at[t])
-          plgpu.wait_load_tmem()
-          plgpu.async_store_tmem(
-              o_tmem.at[t], o * lax.broadcast_in_dim(alpha, o.shape, [0]))
+          with jax.named_scope("sm_rescale"):
+            o = plgpu.async_load_tmem(o_tmem.at[t])
+            plgpu.wait_load_tmem()
+            plgpu.async_store_tmem(
+                o_tmem.at[t], o * lax.broadcast_in_dim(alpha, o.shape, [0]))
 
-        plgpu.commit_tmem()
-        plgpu.barrier_arrive(p_ready.at[t])
+        with jax.named_scope("sm_commit"):
+          plgpu.commit_tmem()
+          plgpu.barrier_arrive(p_ready.at[t])
         return m_next, l_next
 
       m_i, l_i = lax.fori_loop(
@@ -422,6 +446,7 @@ def splash_attention_forward_pingpong(
       compiler_params=plgpu.CompilerParams(
           lowering_semantics=plgpu.LoweringSemantics.Warpgroup,
           approx_math=True,
+          **_profile_params(),
       ),
       interpret=interpret,
   )(*inputs)
