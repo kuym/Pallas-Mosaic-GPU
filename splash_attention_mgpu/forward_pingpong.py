@@ -157,6 +157,9 @@ def splash_attention_forward_pingpong(
   q_heads_per_kv_head = num_q_heads // num_kv_heads
   mask_heads = num_steps.shape[0]
   serialize_pv = interpret is not None
+  # Debug-only ablations that remove work to bound its cost (wrong results):
+  # SPLASH_ABLATE in {norescale, noexp, nosoftmax}.
+  ablate = os.environ.get("SPLASH_ABLATE", "")
   if exp_emulation_cols is None:
     exp_emulation_cols = int(os.environ.get("SPLASH_EXP_EMU_COLS", 0))
   if exp_emulation_cols % 16 or not 0 <= exp_emulation_cols < bkv:
@@ -387,7 +390,13 @@ def splash_attention_forward_pingpong(
           alpha = jnp.exp2(m_prev - m_next)
           ps = []
           for i, x in enumerate(qks):
+            if ablate == "nosoftmax":  # perf experiment only: wrong results
+              ps.append(x)
+              continue
             x = x - lax.broadcast_in_dim(m_next, x.shape, [0])
+            if ablate == "noexp":  # perf experiment only: wrong results
+              ps.append(x)
+              continue
             # The first `exp_emulation_cols` columns use a polynomial on the
             # FMA pipe, relieving the special-function unit (FA4's trick).
             p = exp2_emulated(x) if (i == 0 and exp_emulation_cols) else jnp.exp2(x)
@@ -404,7 +413,7 @@ def splash_attention_forward_pingpong(
         # reduction, and Mosaic GPU places every cross-warp reduction scratch
         # at the same SMEM offset: the two softmax warpgroups would clobber
         # each other (observed on B200: wrong results and deadlocks).
-        @pl.when(s > 0)
+        @pl.when(jnp.logical_and(s > 0, ablate not in ("norescale", "nosoftmax")))
         def _rescale_o():
           with jax.named_scope("sm_rescale"):
             o = plgpu.async_load_tmem(o_tmem.at[t])
