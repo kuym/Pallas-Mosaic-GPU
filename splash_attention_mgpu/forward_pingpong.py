@@ -114,6 +114,20 @@ def _profile_params():
               profile_bounds_check=True)
 
 
+def pingpong_smem_bytes(*, head_dim, block_kv, num_stages, itemsize,
+                        has_dense_mask, has_segments, save_residuals):
+  return (CTA_ROWS * head_dim * itemsize
+          + num_stages * block_kv * 2 * head_dim * itemsize
+          + (num_stages * CTA_ROWS * block_kv if has_dense_mask else 0)
+          + (CTA_ROWS + num_stages * block_kv) * 4 * has_segments
+          + CTA_ROWS * 4 * save_residuals
+          + NUM_TILES * TILE * 4)  # optional correction alpha buffer
+
+
+def pingpong_fits(**kwargs) -> bool:
+  return pingpong_smem_bytes(**kwargs) <= SMEM_BYTES
+
+
 def splash_attention_forward_pingpong(
     q, k, v,
     segment_ids: SegmentIds | None,
@@ -154,13 +168,10 @@ def splash_attention_forward_pingpong(
   if tmem_cols > TMEM_COLS:
     raise ValueError(f"TMEM budget exceeded ({tmem_cols} > {TMEM_COLS}); "
                      "use a smaller block_kv")
-  smem_bytes = (
-      CTA_ROWS * head_dim * itemsize
-      + num_stages * bkv * 2 * head_dim * itemsize
-      + (num_stages * CTA_ROWS * bkv if has_dense_mask else 0)
-      + (CTA_ROWS + num_stages * bkv) * 4 * has_segments
-      + CTA_ROWS * 4 * save_residuals
-  )
+  smem_bytes = pingpong_smem_bytes(
+      head_dim=head_dim, block_kv=bkv, num_stages=num_stages,
+      itemsize=itemsize, has_dense_mask=has_dense_mask,
+      has_segments=has_segments, save_residuals=save_residuals)
   if smem_bytes > SMEM_BYTES:
     raise ValueError(f"Shared memory budget exceeded ({smem_bytes} > "
                      f"{SMEM_BYTES} bytes); reduce num_stages or block_kv")

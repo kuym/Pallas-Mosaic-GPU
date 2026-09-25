@@ -546,3 +546,14 @@ def test_auto_block_q_selection():
   assert sa.make_splash_mha(sa.FullMask((s, s)),
                             block_sizes=sa.BlockSizes(block_q=128)
                             ).choose_block_q(128, 128) == 128
+
+
+def test_auto_block_q_respects_smem():
+  # Dense masks at D=128 need 256-row int8 mask blocks: the ping-pong kernel
+  # does not fit with block_kv=128, so auto falls back to 128 (found when
+  # lowering the gradient of a dense-mask kernel).
+  dense = np.tril(np.ones((2048, 2048), bool))
+  assert sa.make_splash_mha(sa.NumpyMask(dense)).choose_block_q(128, 128) == 128
+  assert sa.make_splash_mha(
+      sa.NumpyMask(dense), block_sizes=sa.BlockSizes(block_kv=64)
+  ).choose_block_q(128, 128) == 256

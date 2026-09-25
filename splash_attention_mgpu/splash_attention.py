@@ -102,13 +102,21 @@ class SplashAttentionKernel:
           float(fwd_infos[256].num_steps.sum()) * 256
           / max(1.0, float(fwd_infos[128].num_steps.sum()) * 128))
 
-  def choose_block_q(self, head_dim: int, head_dim_v: int) -> int:
+  def choose_block_q(self, head_dim: int, head_dim_v: int, *,
+                     itemsize: int = 2, has_segments: bool = False,
+                     save_residuals: bool = True) -> int:
     requested = self.requested_block_sizes.block_q
     if requested is not None:
       return requested
+    bs = self.requested_block_sizes
     if (256 in self._variants and head_dim == head_dim_v == 128
         and self.pingpong_extra_work is not None
-        and self.pingpong_extra_work <= AUTO_PINGPONG_MAX_EXTRA_WORK):
+        and self.pingpong_extra_work <= AUTO_PINGPONG_MAX_EXTRA_WORK
+        and forward_pingpong.pingpong_fits(
+            head_dim=head_dim, block_kv=bs.block_kv,
+            num_stages=bs.num_stages, itemsize=itemsize,
+            has_dense_mask=self.fwd_infos[256].partial_mask_blocks is not None,
+            has_segments=has_segments, save_residuals=save_residuals)):
       return 256
     return 128
 
@@ -125,8 +133,9 @@ class SplashAttentionKernel:
       *,
       save_residuals: bool = False,
   ):
-    static, schedule = self._variants[
-        self.choose_block_q(q.shape[-1], v.shape[-1])]
+    static, schedule = self._variants[self.choose_block_q(
+        q.shape[-1], v.shape[-1], itemsize=jnp.dtype(q.dtype).itemsize,
+        has_segments=segment_ids is not None)]
     return _splash_attention(
         q, k, v, segment_ids, schedule,
         is_mqa=self.is_mqa, static=static, save_residuals=save_residuals,
