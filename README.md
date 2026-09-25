@@ -20,9 +20,11 @@ As in the TPU kernel, `q` is expected to be pre-scaled.
 **Status (2026-09-25).** The forward and backward kernels run correctly on
 real B200s. They were tested on a Together AI 8×B200 node: the native test
 suite passes, and 1,020 randomized fuzz cases (415 of them with gradients)
-produced no failures. Forward throughput is 55–60% of cuDNN's flash attention
-at head_dim 128; see [Performance](#performance-on-b200). Optimization is in
-progress.
+produced no failures (a later run over the ping-pong kernel found one API bug,
+which is now fixed). The best forward throughput is 1,105 TFLOP/s at
+head_dim 128, which is 70% of cuDNN's flash attention on the same node; see
+[Performance](#performance-on-b200) and the
+[optimization log](#optimization-log-b200).
 
 ## Features
 
@@ -168,6 +170,54 @@ warpgroup, and its per-block softmax takes about as long as the block's MMAs,
 so the tensor core idles for part of each step. Sparse masks with short rows
 (local, chunked) also pay a per-row prologue and epilogue cost.
 
+### Two-tile ping-pong kernel (`block_q=256`) vs. `block_q=128`
+
+This is the best forward throughput per problem (TFLOP/s) over `block_kv` ×
+`num_stages`, with H=16 MHA unless noted:
+
+| Problem | `block_q=128` | `block_q=256` | Ratio |
+|---|---|---|---|
+| full, S=16K, D=128 | 866 | **1,074–1,105** | 1.24–1.28× |
+| causal, S=16K, D=128 | 840 | 975 | 1.16× |
+| chunked-causal, S=16K, D=128 | 550 | 650 | 1.18× |
+| local 1K, S=16K, D=128 | 609 | 618 | 1.01× |
+| full, S=16K, D=64 | 628 | 598–627 | ~1.0× |
+| local 1K, S=4K, D=64 | 348 | 262 | 0.75× |
+
+`block_q=256` wins for head_dim 128 with long rows. `block_q=128` is better
+at head_dim 64 and for narrow local windows, where the 256-row schedule
+visits about 25% more KV blocks.
+
+## Optimization log (B200)
+
+Each item was A/B-tested on the 8×B200 farm, on full S=16K D=128 unless
+noted:
+
+| Change | Result |
+|---|---|
+| Two Q tiles per CTA with ping-ponged MMAs (`block_q=256`) | **+16–28%** at D=128 (kept, `block_q=256`) |
+| Register split 240/32 → 232/40 | fixed a `setmaxnreg` deadlock |
+| No scalar cross-warp reduction in the ping-pong kernel | fixed wrong results and deadlocks (finding 3) |
+| exp2 polynomial with `round` + `cvt` | −13% or worse: conversions use the same slow unit as `exp2` |
+| exp2 polynomial without conversions (FA4 magic-number rounding) | −2 to +3.5% at best (full D=64). Column splits hurt masked blocks. Off by default |
+| Softmax over 2–8 independent column slices (shorter max/sum chains) | −2% to −39%. ptxas already hides the chains |
+| Correction warpgroup that rescales O off the softmax path | +3% (full D=128), −3 to −16% elsewhere. Off by default |
+| Unmasked-block fast path (log2e folded into the exp2 FMA) | −1% to +5% (D=64). On by default |
+| Scheduling token so the two tiles' softmax phases alternate | +2% (full), −3 to −20% elsewhere. On by default, to be revisited |
+
+Ablations, with deliberately wrong results, show where the time goes. At full
+S=16K D=128 the kernel does 1,087 TFLOP/s. Without the O rescale it does 1,217.
+Without `exp2` it does 1,288. With no softmax math at all it does 1,484, which
+is 94% of cuDNN. So the pipeline itself can keep up, and the remaining gap is
+the cost of the softmax arithmetic. At D=128 the `exp2` work on the
+special-function unit (about 2,048 clk per step per SM sub-partition) equals
+the MMA time. Matching cuDNN therefore requires the softmax warps to keep
+MUFU.EX2 fully busy while hiding all other FP work, which in FA4 and cuDNN is
+SASS-level tuning. Tools: `SPLASH_PROFILE_DIR` (per-warp trace with named
+scopes, summarized by `tools/profile_run.py`) and the `SPLASH_ABLATE`,
+`SPLASH_EXP_EMU_COLS`, `SPLASH_SOFTMAX_PARTS`, `SPLASH_CORRECTION`,
+`SPLASH_SCHEDULE` and `SPLASH_FAST_FULL` switches.
+
 ## Hardware findings
 
 These were found on B200. None of them shows up in the CPU interpreter:
@@ -204,12 +254,9 @@ kernel.
 Each step is A/B-benchmarked on the farm over the full problem grid and fuzzed
 before it is kept:
 
-1. Two ping-ponged Q tiles per CTA (`block_q=256`). In progress: it is
-   correct on B200 after findings 2 and 3 above, and being re-measured.
-2. Compute a fraction of the `exp2` calls with a cubic polynomial on the FMA
-   units. The polynomial is ready, with 7.6e-5 maximum relative error.
-3. A dedicated correction warpgroup that rescales O and runs the epilogue off
-   the softmax critical path.
+1. ~~Two ping-ponged Q tiles per CTA~~: done (`block_q=256`), +16–28% at D=128.
+2. ~~exp2 emulation~~ and 3. ~~correction warpgroup~~: implemented. Neither
+   gains in this code-generation setting; see the optimization log.
 4. A persistent kernel with a heaviest-first tile scheduler and overlapped
    epilogue and prologue, for sparse masks with short rows. After that, 2-CTA
    (`M=256`) MMAs with multicast K/V.
