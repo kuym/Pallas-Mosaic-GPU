@@ -501,7 +501,8 @@ def test_interpret_pingpong_grads(kwargs):
 def test_gpu_pingpong(kwargs):
   kwargs = dict(kwargs)
   kwargs.setdefault("block_sizes", PINGPONG)
-  _check(kwargs.pop("mask_name"), s=2048, **kwargs)
+  kwargs.setdefault("s", 2048)
+  _check(kwargs.pop("mask_name"), **kwargs)
 
 
 @needs_blackwell
