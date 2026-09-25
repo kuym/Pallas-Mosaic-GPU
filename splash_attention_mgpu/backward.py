@@ -124,6 +124,9 @@ def splash_attention_bwd_dq(
   )
   q_heads_per_kv_head = num_q_heads // num_kv_heads
   mask_heads = num_steps.shape[0]
+  # Elementwise warpgroups, each owning bc / ne columns (dS has its own TMEM
+  # buffer, so the warpgroups never touch each other's columns).
+  ne = _num_elementwise_wgs(bc)
 
   def kernel(*refs):
     refs = list(refs)
@@ -161,7 +164,7 @@ def splash_attention_bwd_dq(
       part = lax.rem(t, sub)
       return blk, blk * bkv + part * bc, part
 
-    @pl.when(wg == 1)
+    @pl.when(wg == ne)
     def _producer_wg():
       @plgpu.warp_map
       def _per_warp(warp_id):
@@ -240,8 +243,9 @@ def splash_attention_bwd_dq(
           def _():
             plgpu.tcgen05_commit_arrive(dq_done)
 
-    @pl.when(wg == 0)
-    def _softmax_wg():
+    def elementwise_wg(e):  # e: static index; owns columns [e*w, (e+1)*w)
+      w = bc // ne
+      cols = pl.ds(e * w, w)
       plgpu.barrier_wait(q_barrier)
       lse_rows = plgpu.load(lse_smem, layout=_ROWS)
       delta_rows = plgpu.load(delta_smem, layout=_ROWS)
@@ -252,6 +256,7 @@ def splash_attention_bwd_dq(
       def _softmax_loop(t):
         slot = lax.rem(t, num_stages)
         _, row0, _ = step_block(t)
+        row0 = row0 + e * w
         is_partial = (
             block_kind_gmem[mh, qi, lax.div(t, sub)] == mask_info_lib.PARTIAL
         )
@@ -260,40 +265,44 @@ def splash_attention_bwd_dq(
           if has_dense_mask:
             def load_mask():
               plgpu.barrier_wait(mask_barriers.at[slot])
-              m = plgpu.load(mask_smem.at[slot], layout=plgpu.Layout.TCGEN05)
+              m = plgpu.load(mask_smem.at[slot, :, cols],
+                             layout=plgpu.Layout.TCGEN05)
               return _where(m != 0, x, mask_value)
             x = lax.cond(is_partial, load_mask, lambda: x)
           elif mask_function is not None:
             def compute_mask():
               q_pos = qi * bq + plgpu.broadcasted_iota(
-                  jnp.int32, (bq, bc), 0, layout=plgpu.Layout.TCGEN05)
+                  jnp.int32, (bq, w), 0, layout=plgpu.Layout.TCGEN05)
               kv_pos = row0 + plgpu.broadcasted_iota(
-                  jnp.int32, (bq, bc), 1, layout=plgpu.Layout.TCGEN05)
+                  jnp.int32, (bq, w), 1, layout=plgpu.Layout.TCGEN05)
               return _where(mask_function(q_pos, kv_pos), x, mask_value)
             x = lax.cond(is_partial, compute_mask, lambda: x)
           if has_segments:
             plgpu.barrier_wait(seg_barriers.at[slot])
-            kv_ids = plgpu.load(kv_seg_smem.at[slot], layout=_COLS)
-            same = (lax.broadcast_in_dim(q_ids, (bq, bc), [0])
-                    == lax.broadcast_in_dim(kv_ids, (bq, bc), [1]))
+            kv_ids = plgpu.load(kv_seg_smem.at[slot, cols], layout=_COLS)
+            same = (lax.broadcast_in_dim(q_ids, (bq, w), [0])
+                    == lax.broadcast_in_dim(kv_ids, (bq, w), [1]))
             x = _where(same, x, mask_value)
           return x
 
         plgpu.barrier_wait(s_ready)
-        logits = plgpu.async_load_tmem(s_tmem)
-        dp = plgpu.async_load_tmem(dp_tmem)
+        logits = plgpu.async_load_tmem(s_tmem.at[:, cols])
+        dp = plgpu.async_load_tmem(dp_tmem.at[:, cols])
         plgpu.wait_load_tmem()
         _, ds = _probs_and_dlogits(
             logits, dp, lse_rows, delta_rows, masks=masks,
             soft_cap=attn_logits_soft_cap, mask_value=mask_value,
             lse_dims=[0],
         )
-        plgpu.async_store_tmem(ds_tmem, ds.astype(dtype))
+        plgpu.async_store_tmem(ds_tmem.at[:, cols], ds.astype(dtype))
         plgpu.commit_tmem()
         if has_aux:
           plgpu.commit_smem()  # Fence generic reads before TMA overwrites.
           plgpu.barrier_arrive(aux_consumed.at[slot])
         plgpu.barrier_arrive(ds_ready)
+
+      if e != 0:
+        return
 
       def read_dq():
         plgpu.barrier_wait(dq_done)
@@ -307,6 +316,9 @@ def splash_attention_bwd_dq(
       plgpu.commit_smem()
       plgpu.copy_smem_to_gmem(q_smem, dq_gmem.at[b, h, q_slice])
       plgpu.wait_smem_to_gmem(0)
+
+    for e in range(ne):
+      pl.when(wg == e)(functools.partial(elementwise_wg, e))
 
   qk_t = _swizzle_transforms(head_dim, dtype)
   v_t = _swizzle_transforms(head_dim_v, dtype)
@@ -330,9 +342,10 @@ def splash_attention_bwd_dq(
       plgpu.Barrier(num_barriers=num_stages) if has_segments else None,
       plgpu.Barrier(num_barriers=num_stages) if has_dense_mask else None,
       plgpu.Barrier(num_barriers=num_stages, orders_tensor_core=True),
-      plgpu.Barrier(num_barriers=num_stages) if has_aux else None,
+      plgpu.Barrier(num_arrivals=ne, num_barriers=num_stages)
+      if has_aux else None,
       plgpu.Barrier(orders_tensor_core=True),
-      plgpu.Barrier(orders_tensor_core=True),
+      plgpu.Barrier(num_arrivals=ne, orders_tensor_core=True),
       plgpu.Barrier(orders_tensor_core=True),
   ]
   inputs = [q, k, v, do, lse, delta]
@@ -345,6 +358,7 @@ def splash_attention_bwd_dq(
       kernel, scratch_types, inputs,
       out_type=jax.ShapeDtypeStruct(q.shape, dtype),
       grid=(q_seq_len // bq, num_q_heads, batch),
+      num_threads=ne + 1,
       interpret=interpret,
   )
 
@@ -388,6 +402,10 @@ def splash_attention_bwd_dkv(
   nbuf = 2 if (num_stages >= 2 and 4 * bc + head_dim + head_dim_v <= TMEM_COLS
                and os.environ.get("SPLASH_BWD_DOUBLE_BUFFER", "0") == "1") else 1
   serialize_mma = interpret is not None  # P^T aliases S^T in both modes
+  # Elementwise warpgroups, each owning bc / ne columns of the score tile
+  # (the dK/dV elementwise work needs no row reductions, so no cross-
+  # warpgroup communication): more warps per SM sub-partition hide latency.
+  ne = _num_elementwise_wgs(bc)
   _check_budgets(
       "dKV kernel",
       tmem_cols=2 * nbuf * bc + head_dim + head_dim_v,
@@ -420,7 +438,7 @@ def splash_attention_bwd_dkv(
         kv_seg_smem, q_seg_smem, mask_smem,
         sp_unions, dd_unions, dk_tmem, dv_tmem,
         kv_barrier, q_barriers, mask_barriers,
-        consumed, aux_consumed, s_ready, p_ready, done, mma_order,
+        consumed, aux_consumed, s_ready, p_ready, done, mma_order, loaded,
     ) = refs
 
     def bufs(i):
@@ -479,7 +497,7 @@ def splash_attention_bwd_dkv(
 
     n = total_steps()
 
-    @pl.when(wg == 1)
+    @pl.when(wg == ne)
     def _producer_wg():
       @plgpu.warp_map
       def _per_warp(warp_id):
@@ -594,8 +612,9 @@ def splash_attention_bwd_dkv(
           def _():
             plgpu.tcgen05_commit_arrive(done)
 
-    @pl.when(wg == 0)
-    def _softmax_wg():
+    def elementwise_wg(e):  # e: static index; owns columns [e*w, (e+1)*w)
+      w = bc // ne
+      cols = pl.ds(e * w, w)
       plgpu.barrier_wait(kv_barrier)
       if has_segments:
         kv_ids = plgpu.load(kv_seg_smem, layout=_ROWS)
@@ -604,6 +623,7 @@ def splash_attention_bwd_dkv(
         del h
         slot = lax.rem(t, num_stages)
         _, row0, _ = step_rows(mh, u)
+        row0 = row0 + e * w
         is_partial = (
             block_kind_gmem[mh, kj, lax.div(u, sub)] == mask_info_lib.PARTIAL
         )
@@ -612,27 +632,28 @@ def splash_attention_bwd_dkv(
           if has_dense_mask:
             def load_mask():
               plgpu.barrier_wait(mask_barriers.at[slot])
-              m = plgpu.load(mask_smem.at[slot], layout=plgpu.Layout.TCGEN05)
+              m = plgpu.load(mask_smem.at[slot, :, cols],
+                             layout=plgpu.Layout.TCGEN05)
               return _where(m != 0, x, mask_value)
             x = lax.cond(is_partial, load_mask, lambda: x)
           elif mask_function is not None:
             def compute_mask():
               kv_pos = kj * bkv + plgpu.broadcasted_iota(
-                  jnp.int32, (bkv, bc), 0, layout=plgpu.Layout.TCGEN05)
+                  jnp.int32, (bkv, w), 0, layout=plgpu.Layout.TCGEN05)
               q_pos = row0 + plgpu.broadcasted_iota(
-                  jnp.int32, (bkv, bc), 1, layout=plgpu.Layout.TCGEN05)
+                  jnp.int32, (bkv, w), 1, layout=plgpu.Layout.TCGEN05)
               return _where(mask_function(q_pos, kv_pos), x, mask_value)
             x = lax.cond(is_partial, compute_mask, lambda: x)
           if has_segments:
-            q_ids = plgpu.load(q_seg_smem.at[slot], layout=_COLS)
-            same = (lax.broadcast_in_dim(kv_ids, (bkv, bc), [0])
-                    == lax.broadcast_in_dim(q_ids, (bkv, bc), [1]))
+            q_ids = plgpu.load(q_seg_smem.at[slot, cols], layout=_COLS)
+            same = (lax.broadcast_in_dim(kv_ids, (bkv, w), [0])
+                    == lax.broadcast_in_dim(q_ids, (bkv, w), [1]))
             x = _where(same, x, mask_value)
           return x
 
         plgpu.barrier_wait(q_barriers.at[slot])  # lse / delta / q segment ids
-        lse = plgpu.load(lse_smem.at[slot], layout=_COLS)
-        delta = plgpu.load(delta_smem.at[slot], layout=_COLS)
+        lse = plgpu.load(lse_smem.at[slot, cols], layout=_COLS)
+        delta = plgpu.load(delta_smem.at[slot, cols], layout=_COLS)
         plgpu.barrier_wait(s_ready.at[lax.rem(t, nbuf)])
         for_buffer(t, functools.partial(elementwise, t, slot, masks, lse, delta))
         plgpu.commit_smem()  # Fence generic reads before TMA overwrites.
@@ -641,10 +662,16 @@ def splash_attention_bwd_dkv(
 
       def elementwise(t, slot, masks, lse, delta, i):
         del t, slot
-        st, dpt, pt, dst = bufs(i)
+        st, dpt, pt, dst = (r.at[:, cols] for r in bufs(i))
         logits_t = plgpu.async_load_tmem(st)
         dp_t = plgpu.async_load_tmem(dpt)
         plgpu.wait_load_tmem()  # P^T / dS^T overwrite these columns below
+        if ne > 1:
+          # Packed bf16 P^T/dS^T use half the columns of S^T/dP^T, so a
+          # warpgroup's P^T lands in columns another warpgroup reads S^T
+          # from: every warpgroup must have loaded before any stores.
+          plgpu.barrier_arrive(loaded.at[i])
+          plgpu.barrier_wait(loaded.at[i])
         p_t, ds_t = _probs_and_dlogits(
             logits_t, dp_t, lse, delta, masks=masks,
             soft_cap=attn_logits_soft_cap, mask_value=mask_value,
@@ -668,12 +695,20 @@ def splash_attention_bwd_dkv(
         plgpu.barrier_wait(done)
 
       # All MMAs reading k_smem / v_smem are done: reuse them for the output.
-      k_smem[...] = read(dk_tmem, head_dim)
-      v_smem[...] = read(dv_tmem, head_dim_v)
+      # With two elementwise warpgroups one writes dK and the other dV.
+      if e == 0:
+        k_smem[...] = read(dk_tmem, head_dim)
+      if e == ne - 1:
+        v_smem[...] = read(dv_tmem, head_dim_v)
       plgpu.commit_smem()
-      plgpu.copy_smem_to_gmem(k_smem, dk_gmem.at[b, hk, kv_slice])
-      plgpu.copy_smem_to_gmem(v_smem, dv_gmem.at[b, hk, kv_slice])
+      if e == 0:
+        plgpu.copy_smem_to_gmem(k_smem, dk_gmem.at[b, hk, kv_slice])
+      if e == ne - 1:
+        plgpu.copy_smem_to_gmem(v_smem, dv_gmem.at[b, hk, kv_slice])
       plgpu.wait_smem_to_gmem(0)
+
+    for e in range(ne):
+      pl.when(wg == e)(functools.partial(elementwise_wg, e))
 
   qk_t = _swizzle_transforms(head_dim, dtype)
   v_t = _swizzle_transforms(head_dim_v, dtype)
@@ -699,12 +734,15 @@ def splash_attention_bwd_dkv(
       plgpu.Barrier(num_arrivals=4 + has_segments, num_barriers=num_stages),
       plgpu.Barrier(num_barriers=num_stages) if has_dense_mask else None,
       plgpu.Barrier(num_barriers=num_stages, orders_tensor_core=True),
-      plgpu.Barrier(num_barriers=num_stages),
+      plgpu.Barrier(num_arrivals=ne, num_barriers=num_stages),
       plgpu.Barrier(num_barriers=nbuf, orders_tensor_core=True),
-      plgpu.Barrier(num_barriers=nbuf, orders_tensor_core=True),
+      plgpu.Barrier(num_arrivals=ne, num_barriers=nbuf,
+                    orders_tensor_core=True),
       plgpu.Barrier(orders_tensor_core=True),
       plgpu.Barrier(num_barriers=nbuf, orders_tensor_core=True)
       if serialize_mma else None,
+      plgpu.Barrier(num_arrivals=ne, num_barriers=nbuf, orders_tensor_core=True)
+      if ne > 1 else None,
   ]
   inputs = [q, k, v, do, lse, delta]
   if has_segments:
@@ -718,12 +756,20 @@ def splash_attention_bwd_dkv(
                 jax.ShapeDtypeStruct(v.shape, dtype)),
       grid=(kv_seq_len // bkv, num_kv_heads, batch),
       grid_names=("kv", "h", "b"),
+      num_threads=ne + 1,
       interpret=interpret,
   )
 
 
+def _num_elementwise_wgs(bc):
+  ne = int(os.environ.get("SPLASH_BWD_WGS", 2))
+  while ne > 1 and (bc // ne) % 16:
+    ne //= 2  # each warpgroup needs a multiple of 16 columns
+  return ne
+
+
 def _launch(kernel, scratch_types, inputs, *, out_type, grid,
-            grid_names=("q", "h", "b"), interpret):
+            grid_names=("q", "h", "b"), num_threads=2, interpret):
   def entry(*refs):
     present = [t for t in scratch_types if t is not None]
 
@@ -738,7 +784,7 @@ def _launch(kernel, scratch_types, inputs, *, out_type, grid,
       out_type=out_type,
       grid=grid,
       grid_names=grid_names,
-      num_threads=2,
+      num_threads=num_threads,
       thread_name="wg",
       compiler_params=plgpu.CompilerParams(
           lowering_semantics=plgpu.LoweringSemantics.Warpgroup,
