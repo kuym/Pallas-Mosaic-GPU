@@ -34,7 +34,7 @@ head_dim 128, which is 70% of cuDNN's flash attention on the same node; see
 | Sparsity | Empty blocks are never loaded or computed; full blocks skip masking; partial blocks are masked with the in-kernel mask function or with the stored dense block |
 | Attention variants | MHA, GQA, MQA, segment ids, logit soft-capping, optional batch dim |
 | Outputs | Output and optional logsumexp residual (`save_residuals=True`) |
-| Gradients | `custom_vjp` with dQ and dK/dV Mosaic GPU kernels (split like the TPU module) |
+| Gradients | `custom_vjp`. For head_dim 128, a fused single-kernel backward (dQ via TMA reduce-add). Otherwise, dQ and dK/dV kernels split like the TPU module |
 | Dtypes | bf16, f16 (f32 accumulation) |
 | Head dims | Forward: multiples of 64 up to 256 (`block_kv=64` for 256). Backward: up to 128 |
 | Kernels | `block_q=128` (default): one softmax warpgroup per CTA. `block_q=256`: experimental two-tile "ping-pong" kernel (FlashAttention-4 style), head_dim 64/128 |
@@ -74,7 +74,16 @@ therefore works on one tile while the other tile's softmax runs. P is stored
 in TMEM over S (`RefUnion`), so two tiles × (S/P + O) fit in the 512 TMEM
 columns at head_dim 128. The sparse schedule is built at 256-row granularity.
 
-**Backward kernels** (`backward.py`). The same warp specialization is used.
+**Fused backward** (`backward_fused.py`, head_dim 128, the default there).
+One CTA owns a KV block and loops over the q sub-blocks of every q head in the
+group. It computes Sᵀ and dPᵀ once per step. The MMA warp issues
+Sᵀ = K·Qᵀ, dPᵀ = V·dOᵀ, dV += Pᵀ·dO, dK += dSᵀ·Q and dQᵀ = Kᵀ·dSᵀ: 5 MMAs,
+where the split backward needs 7. Two elementwise warpgroups compute Pᵀ and dSᵀ,
+each owning a column slice. A dQ-writer warpgroup moves dQᵀ from TMEM to SMEM
+and TMA reduce-adds it into an f32 `[B, H, D, Sq]` accumulator, a
+`jax.new_ref` operand that XLA transposes once at the end.
+
+**Split backward kernels** (`backward.py`). The same warp specialization is used.
 The dQ kernel recomputes S and dP = dO Vᵀ for each KV sub-block, forms
 dS = P ⊙ (dP − Δ) and accumulates dQ += dS K. The dK/dV kernel works on
 Sᵀ = K Qᵀ and dPᵀ = V dOᵀ for q sub-blocks of 64 rows, accumulates
@@ -188,6 +197,16 @@ This is the best forward throughput per problem (TFLOP/s) over `block_kv` ×
 at head_dim 64 and for narrow local windows, where the 256-row schedule
 visits about 25% more KV blocks.
 
+### Backward on B200 (fwd+bwd TFLOP/s, head_dim 128, H=16)
+
+| Problem | two-kernel, 64-wide tiles (first version) | two-kernel, 128-wide tiles, 2 WGs | **fused** | cuDNN |
+|---|---|---|---|---|
+| full, S=16K | 678 | 783 | **832** | 1,317 |
+| causal, S=16K | 639 | 709 | **796** | 1,317 |
+| local 1K, S=16K | 477 | 447 | **568** | — |
+| chunked 2K, S=16K | 476 | 437 | **557** | — |
+| causal, S=4K | 555 | 586 | **668** | 975 |
+
 ## Optimization log (B200)
 
 Each item was A/B-tested on the 8×B200 farm, on full S=16K D=128 unless
@@ -206,6 +225,10 @@ noted:
 | Scheduling token so the two tiles' softmax phases alternate | +2% (full), −3 to −20% elsewhere. Off by default |
 | Double-buffered Sᵀ/dPᵀ in the dK/dV kernel (overlap MMAs with elementwise work) | −8% (full D=128) to +3% (short/masked). Off by default (`SPLASH_BWD_DOUBLE_BUFFER=1`) |
 | Automatic `block_q` (ping-pong for D=128 when the 256-row schedule adds ≤10% work) | the best kernel per problem by default |
+| Automatic forward tiles (D=64 with `block_q=128`: `block_kv=64`, 3 stages) | +25–28% forward at D=64 (full, causal, local). Chunked-causal D=64 −18%, to revisit |
+| Backward: two elementwise warpgroups (column split; `loaded` barrier for packed-P aliasing) | +0–2% alone |
+| Backward: 128-wide sub-blocks (fits TMEM once Pᵀ/dSᵀ alias Sᵀ/dPᵀ) | with 2 WGs: +7–15% fwd+bwd. Profile: per-step MMA↔elementwise handoff latency dominated at 64-wide steps |
+| **Fused backward** (one kernel, 5 MMAs, dQ via TMA reduce-add) | **+6% (full) to +30% (local/chunked)** fwd+bwd at D=128 |
 
 Ablations, with deliberately wrong results, show where the time goes. At full
 S=16K D=128 the kernel does 1,087 TFLOP/s. Without the O rescale it does 1,217.
