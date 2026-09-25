@@ -74,16 +74,17 @@ class BlockSizes:
   block_q / block_kv: granularity of the sparse schedule (and of the forward
     kernel's tiles).
   num_stages: depth of the forward kernel's K/V SMEM ring.
-  block_kv_dq: KV rows per step of the dQ kernel (a divisor of block_kv).
-  block_q_dkv: q rows per step of the dK/dV kernel (a divisor of block_q).
+  block_kv_dq: KV rows per step of the dQ kernel (64 or 128; None picks the
+    largest that fits the SMEM/TMEM budgets).
+  block_q_dkv: q rows per step of the dK/dV kernel (64 or 128; None likewise).
   num_stages_bwd: depth of the backward kernels' SMEM rings.
   """
 
   block_q: int | None = None  # None: choose 128 or 256 per call (see below)
   block_kv: int = 128
   num_stages: int = 2
-  block_kv_dq: int = 64
-  block_q_dkv: int = 64
+  block_kv_dq: int | None = None
+  block_q_dkv: int | None = None
   num_stages_bwd: int = 2
 
   def __post_init__(self):
@@ -100,9 +101,9 @@ class BlockSizes:
       raise ValueError(f"num_stages must be >= 2, got {self.num_stages}")
     # The backward kernels contract over these sub-block sizes, and tcgen05
     # needs 16-bit contraction dims in multiples of 64.
-    if self.block_kv_dq not in (64, 128):
+    if self.block_kv_dq not in (None, 64, 128):
       raise ValueError(f"block_kv_dq={self.block_kv_dq} must be 64 or 128")
-    if self.block_q_dkv not in (64, 128):
+    if self.block_q_dkv not in (None, 64, 128):
       raise ValueError(f"block_q_dkv={self.block_q_dkv} must be 64 or 128")
     if self.num_stages_bwd < 1:
       raise ValueError("num_stages_bwd must be >= 1")

@@ -104,25 +104,29 @@ def splash_attention_bwd_dq(
   dtype = q.dtype
   bq = 128
   bkv = block_kv  # schedule granularity
-  bc = block_kv_compute  # KV rows per step
-  if bkv % bc:
-    raise ValueError(f"{block_kv_compute=} must divide {block_kv=}")
-  sub = bkv // bc
   itemsize = jnp.dtype(dtype).itemsize
   has_dense_mask = partial_mask_blocks is not None
   has_segments = segment_ids is not None
   has_aux = has_dense_mask or has_segments
-  _check_budgets(
-      "dQ kernel",
-      tmem_cols=2 * bc + bc // 2 + head_dim,
-      smem_bytes=(
-          bq * (head_dim + head_dim_v) * itemsize
-          + num_stages * bc * (head_dim + head_dim_v) * itemsize
-          + 2 * bq * 4
-          + (num_stages * bq * bc if has_dense_mask else 0)
-          + (bq + num_stages * bc) * 4 * has_segments
-      ),
-  )
+
+  def budgets(bc):
+    return dict(
+        tmem_cols=2 * bc + bc // 2 + head_dim,
+        smem_bytes=(
+            bq * (head_dim + head_dim_v) * itemsize
+            + num_stages * bc * (head_dim + head_dim_v) * itemsize
+            + 2 * bq * 4
+            + (num_stages * bq * bc if has_dense_mask else 0)
+            + (bq + num_stages * bc) * 4 * has_segments
+        ))
+
+  # None: the largest sub-block that fits (128-wide steps amortize the
+  # per-step MMA <-> elementwise handoff latency; +7-15% on B200).
+  bc = block_kv_compute or _largest_fitting(bkv, budgets)
+  if bkv % bc:
+    raise ValueError(f"{block_kv_compute=} must divide {block_kv=}")
+  sub = bkv // bc
+  _check_budgets("dQ kernel", **budgets(bc))
   q_heads_per_kv_head = num_q_heads // num_kv_heads
   mask_heads = num_steps.shape[0]
   # Elementwise warpgroups, each owning bc / ne columns (dS has its own TMEM
@@ -393,36 +397,42 @@ def splash_attention_bwd_dkv(
   _, num_kv_heads, kv_seq_len, head_dim_v = v.shape
   dtype = q.dtype
   bq = 128  # schedule granularity along q
-  bc = block_q_compute  # q rows per step
   bkv = block_kv
   if bkv != 128:
     raise NotImplementedError("The dKV kernel needs block_kv == 128.")
-  if bq % bc:
-    raise ValueError(f"{block_q_compute=} must divide {bq}")
-  sub = bq // bc
   itemsize = jnp.dtype(dtype).itemsize
   has_dense_mask = partial_mask_blocks_t is not None
   has_segments = segment_ids is not None
-  # Double-buffer S^T/dP^T (with P^T/dS^T aliased onto them) so the MMAs of
-  # step t+1 overlap the elementwise work of step t.  Needs a second SMEM
-  # stage (the prefetched step's Q/dO) and 4 * bc + dk + dv TMEM columns.
-  nbuf = 2 if (num_stages >= 2 and 4 * bc + head_dim + head_dim_v <= TMEM_COLS
-               and os.environ.get("SPLASH_BWD_DOUBLE_BUFFER", "0") == "1") else 1
+  double_buffer = os.environ.get("SPLASH_BWD_DOUBLE_BUFFER", "0") == "1"
+
+  def num_buffers(bc):
+    # Double-buffer S^T/dP^T (with P^T/dS^T aliased onto them) so the MMAs
+    # of step t+1 overlap the elementwise work of step t.  Needs a second
+    # SMEM stage (the prefetched step's Q/dO) and 4 * bc + dk + dv columns.
+    return 2 if (double_buffer and num_stages >= 2
+                 and 4 * bc + head_dim + head_dim_v <= TMEM_COLS) else 1
+
+  def budgets(bc):
+    return dict(
+        tmem_cols=2 * num_buffers(bc) * bc + head_dim + head_dim_v,
+        smem_bytes=(
+            bkv * (head_dim + head_dim_v) * itemsize
+            + num_stages * bc * ((head_dim + head_dim_v) * itemsize + 8)
+            + (num_stages * bkv * bc if has_dense_mask else 0)
+            + (bkv + num_stages * bc) * 4 * has_segments
+        ))
+
+  bc = block_q_compute or _largest_fitting(bq, budgets)  # q rows per step
+  if bq % bc:
+    raise ValueError(f"{block_q_compute=} must divide {bq}")
+  sub = bq // bc
+  nbuf = num_buffers(bc)
   serialize_mma = interpret is not None  # P^T aliases S^T in both modes
   # Elementwise warpgroups, each owning bc / ne columns of the score tile
   # (the dK/dV elementwise work needs no row reductions, so no cross-
   # warpgroup communication): more warps per SM sub-partition hide latency.
   ne = _num_elementwise_wgs(bc)
-  _check_budgets(
-      "dKV kernel",
-      tmem_cols=2 * nbuf * bc + head_dim + head_dim_v,
-      smem_bytes=(
-          bkv * (head_dim + head_dim_v) * itemsize
-          + num_stages * bc * ((head_dim + head_dim_v) * itemsize + 8)
-          + (num_stages * bkv * bc if has_dense_mask else 0)
-          + (bkv + num_stages * bc) * 4 * has_segments
-      ),
-  )
+  _check_budgets("dKV kernel", **budgets(bc))
   group = num_q_heads // num_kv_heads
   mask_heads = num_steps.shape[0]
 
@@ -773,6 +783,14 @@ def splash_attention_bwd_dkv(
       num_threads=ne + 1,
       interpret=interpret,
   )
+
+
+def _largest_fitting(limit, budgets):
+  for bc in (128, 64):
+    b = budgets(bc)
+    if bc <= limit and b["tmem_cols"] <= TMEM_COLS and b["smem_bytes"] <= SMEM_BYTES:
+      return bc
+  return 64  # _check_budgets reports the problem
 
 
 def _num_elementwise_wgs(bc):
