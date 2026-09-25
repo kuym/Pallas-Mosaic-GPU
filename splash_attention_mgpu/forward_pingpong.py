@@ -53,6 +53,9 @@ from .kernel import (
 TILE = 128
 NUM_TILES = 2
 CTA_ROWS = TILE * NUM_TILES
+# O columns rescaled per TMEM round trip by the correction warpgroup (bounds
+# its register use).
+_CORRECTION_CHUNK = 32
 _ROWS = plgpu.Layout.TCGEN05.reduce(1)
 _COLS = plgpu.Layout.TCGEN05.reduce(0)
 
@@ -127,6 +130,7 @@ def splash_attention_forward_pingpong(
     producer_registers: int | None = None,
     exp_emulation_cols: int | None = None,
     softmax_parts: int | None = None,
+    correction: bool | None = None,
     interpret: Any = None,
 ):
   batch, num_q_heads, q_seq_len, head_dim = q.shape
@@ -162,10 +166,20 @@ def splash_attention_forward_pingpong(
   # setmaxnreg: 2 x 128 x 232 + 128 x 40 = 64512 of the SM's 65536 registers
   # (the same split as JAX's Hopper attention kernel).  SPLASH_PP_REGS="a,b"
   # overrides it for experiments; "0,0" disables register reallocation.
+  if correction is None:
+    correction = os.environ.get("SPLASH_CORRECTION", "0") == "1"
+  correction_registers = 64
   env_regs = os.environ.get("SPLASH_PP_REGS")
   if env_regs:
-    softmax_registers, producer_registers = map(int, env_regs.split(","))
-  softmax_registers = 232 if softmax_registers is None else softmax_registers
+    regs = list(map(int, env_regs.split(",")))
+    softmax_registers, producer_registers = regs[:2]
+    if len(regs) > 2:
+      correction_registers = regs[2]
+  # 4 warpgroups: 2 x 200 + 64 + 40 = 504 x 128 registers (slack for
+  # setmaxnreg); 3 warpgroups: 2 x 232 + 40 = 504 x 128.
+  default_softmax = 200 if correction else 232
+  softmax_registers = (default_softmax if softmax_registers is None
+                       else softmax_registers)
   producer_registers = 40 if producer_registers is None else producer_registers
   q_heads_per_kv_head = num_q_heads // num_kv_heads
   mask_heads = num_steps.shape[0]
@@ -215,7 +229,10 @@ def splash_attention_forward_pingpong(
         sp0, sp1, o_tmem,
         q_barrier, k_barriers, v_barriers, seg_barriers, mask_barriers,
         kv_consumed, aux_consumed, s_ready, p_ready, o_done, pv_order,
+        alpha_smem, alpha_ready, alpha_consumed, o_free, o_corrected,
     ) = refs
+    CORRECTION_WG = NUM_TILES
+    PRODUCER_WG = NUM_TILES + int(correction)
     s_tmems = (sp0[0], sp1[0])
     p_tmems = (sp0[1], sp1[1])
 
@@ -228,7 +245,7 @@ def splash_attention_forward_pingpong(
     n = num_steps_gmem[mh, qi]
     cta_rows = pl.ds(qi * CTA_ROWS, CTA_ROWS)
 
-    @pl.when(wg == NUM_TILES)
+    @pl.when(wg == PRODUCER_WG)
     def _producer_wg():
       if producer_registers:
         plgpu.set_max_registers(producer_registers, action="decrease")
@@ -291,11 +308,20 @@ def splash_attention_forward_pingpong(
             # An explicit commit tracks every earlier MMA of this thread,
             # including PV_t(s-1), which the softmax relies on.
             plgpu.tcgen05_commit_arrive(s_ready.at[t])
+            if correction:
+              # O_t is free for the correction warpgroup (PV_t(s-1) is done).
+              @pl.when(s > 0)
+              def _():
+                plgpu.tcgen05_commit_arrive(o_free.at[t])
 
           def issue_pv(t, s):
             slot = lax.rem(s, num_stages)
             with jax.named_scope(f"mma_wait_p{t}"):
               plgpu.barrier_wait(p_ready.at[t])
+              if correction:
+                @pl.when(s > 0)
+                def _():
+                  plgpu.barrier_wait(o_corrected.at[t])
             plgpu.tcgen05_mma(o_tmem.at[t], p_tmems[t], v_smem.at[slot],
                               accumulate=s > 0)
             if serialize_pv:
@@ -404,6 +430,14 @@ def splash_attention_forward_pingpong(
           needs_rescale = m_curr - m_prev > RESCALE_THRESHOLD
           m_next = _where(needs_rescale, m_curr, m_prev)
           alpha = jnp.exp2(m_prev - m_next)
+          if correction:
+            @pl.when(s > 0)
+            def _publish_alpha():
+              @pl.when(s > 1)
+              def _():  # the correction warpgroup has read alpha(s - 1)
+                plgpu.barrier_wait(alpha_consumed.at[t])
+              alpha_smem[t] = alpha
+              plgpu.barrier_arrive(alpha_ready.at[t])
           ps = []
           for i, x in enumerate(qks):
             if ablate == "nosoftmax":  # perf experiment only: wrong results
@@ -430,7 +464,8 @@ def splash_attention_forward_pingpong(
         # reduction, and Mosaic GPU places every cross-warp reduction scratch
         # at the same SMEM offset: the two softmax warpgroups would clobber
         # each other (observed on B200: wrong results and deadlocks).
-        @pl.when(jnp.logical_and(s > 0, ablate not in ("norescale", "nosoftmax")))
+        @pl.when(jnp.logical_and(
+            s > 0, not correction and ablate not in ("norescale", "nosoftmax")))
         def _rescale_o():
           with jax.named_scope("sm_rescale"):
             o = plgpu.async_load_tmem(o_tmem.at[t])
@@ -447,6 +482,10 @@ def splash_attention_forward_pingpong(
           0, n, body,
           (jnp.full((TILE,), mask_value, jnp.float32),
            jnp.zeros((TILE,), jnp.float32)))
+      if correction:
+        @pl.when(n > 1)
+        def _():  # observe the consumption of the last published alpha
+          plgpu.barrier_wait(alpha_consumed.at[t])
 
       def normalized_output():
         plgpu.barrier_wait(o_done)
@@ -478,6 +517,29 @@ def splash_attention_forward_pingpong(
     for t in range(NUM_TILES):
       pl.when(wg == t)(functools.partial(softmax_wg, t))
 
+    if correction:
+      @pl.when(wg == CORRECTION_WG)
+      def _correction_wg():
+        plgpu.set_max_registers(correction_registers, action="decrease")
+
+        @pl.loop(1, jnp.maximum(n, 1))
+        def _(s):
+          for t in range(NUM_TILES):
+            with jax.named_scope(f"corr_wait{t}"):
+              plgpu.barrier_wait(o_free.at[t])
+              plgpu.barrier_wait(alpha_ready.at[t])
+            with jax.named_scope(f"corr_rescale{t}"):
+              alpha = plgpu.load(alpha_smem.at[t], layout=_ROWS)
+              plgpu.barrier_arrive(alpha_consumed.at[t])
+              for c0 in range(0, head_dim, _CORRECTION_CHUNK):
+                chunk = o_tmem.at[t, :, pl.ds(c0, _CORRECTION_CHUNK)]
+                o = plgpu.async_load_tmem(chunk)
+                plgpu.wait_load_tmem()
+                plgpu.async_store_tmem(
+                    chunk, o * lax.broadcast_in_dim(alpha, o.shape, [0]))
+              plgpu.commit_tmem()
+              plgpu.barrier_arrive(o_corrected.at[t])
+
   qk_t = _swizzle_transforms(head_dim, dtype)
   sp_union = lambda: plgpu.RefUnion(
       plgpu.TMEM((TILE, bkv), jnp.float32),
@@ -507,6 +569,13 @@ def splash_attention_forward_pingpong(
       plgpu.Barrier(orders_tensor_core=True),
       plgpu.Barrier(num_barriers=NUM_TILES, orders_tensor_core=True)
       if serialize_pv else None,
+      plgpu.SMEM((NUM_TILES, TILE), jnp.float32) if correction else None,
+      plgpu.Barrier(num_barriers=NUM_TILES) if correction else None,
+      plgpu.Barrier(num_barriers=NUM_TILES) if correction else None,
+      plgpu.Barrier(num_barriers=NUM_TILES, orders_tensor_core=True)
+      if correction else None,
+      plgpu.Barrier(num_barriers=NUM_TILES, orders_tensor_core=True)
+      if correction else None,
   ]
 
   def entry(*refs):
@@ -532,7 +601,7 @@ def splash_attention_forward_pingpong(
       out_type=tuple(out_type),
       grid=(q_seq_len // CTA_ROWS, num_q_heads, batch),
       grid_names=("q", "h", "b"),
-      num_threads=NUM_TILES + 1,
+      num_threads=NUM_TILES + 1 + int(correction),
       thread_name="wg",
       compiler_params=plgpu.CompilerParams(
           lowering_semantics=plgpu.LoweringSemantics.Warpgroup,
