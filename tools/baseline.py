@@ -26,11 +26,13 @@ def measure(seq, d, heads, kv_heads, causal, backward, iters=20):
   q = jax.random.normal(ks[0], (1, seq, heads, d), jnp.bfloat16)
   k = jax.random.normal(ks[1], (1, seq, kv_heads, d), jnp.bfloat16)
   v = jax.random.normal(ks[2], (1, seq, kv_heads, d), jnp.bfloat16)
-  f = jax.jit(lambda q, k, v: jax.nn.dot_product_attention(
+  attn = jax.jit(lambda q, k, v: jax.nn.dot_product_attention(
       q, k, v, is_causal=causal, implementation="cudnn"))
+  f = attn
   if backward:
-    f = jax.jit(jax.grad(lambda q, k, v: f(q, k, v).astype(jnp.float32).sum(),
-                         argnums=(0, 1, 2)))
+    f = jax.jit(jax.grad(
+        lambda q, k, v: attn(q, k, v).astype(jnp.float32).sum(),
+        argnums=(0, 1, 2)))
   jax.block_until_ready(f(q, k, v))
   _, ms = profiler.measure(f, iterations=iters)(q, k, v)
   ms = statistics.median(ms)
@@ -40,13 +42,19 @@ def measure(seq, d, heads, kv_heads, causal, backward, iters=20):
   return ms * 1e3, flops / ms / 1e9
 
 
+BACKWARD = (False, True)
+
+
 def main():
+  global BACKWARD
+  if "--backward-only" in sys.argv:
+    BACKWARD = (True,)
   out = os.environ.get("FARM_RESULTS")
   for seq in (4096, 16384):
     for d in (64, 128):
       for heads, kvh in ((16, 16), (32, 8)):
         for causal in (False, True):
-          for backward in (False, True):
+          for backward in BACKWARD:
             rec = dict(kind="baseline", impl="cudnn", seq=seq, head_dim=d,
                        heads=heads, kv_heads=kvh,
                        mask="causal" if causal else "full", backward=backward)
