@@ -148,21 +148,48 @@ drives the same thing through one pod that holds all 8 GPUs.
 
 ## Performance on B200
 
-These are bf16 forward TFLOP/s measured with CUDA events on a Together AI
-8×B200 node (driver 610, CUDA 13.3, JAX 0.11), using the best tile sizes from
-the sweep. Splash TFLOP/s count only the visible (computed) 128×128 blocks. The
-cuDNN baseline, `tools/baseline.py`, is `jax.nn.dot_product_attention(implementation="cudnn")`.
+These are bf16 TFLOP/s with the default (automatic) configuration, measured
+with CUDA events on a Together AI 8×B200 node (driver 610, CUDA 13.3, JAX
+0.11). Splash TFLOP/s count only the visible (computed) 128×128 blocks, and
+fwd+bwd counts 3.5× the forward FLOPs. The cuDNN baseline, `tools/baseline.py`,
+is `jax.nn.dot_product_attention(implementation="cudnn")`; the percentages in
+parentheses are Splash as a share of cuDNN. Every configuration with S ≤ 4K is
+also checked against the dense reference.
 
-| Problem (H=16, MHA unless noted) | Splash `block_q=128` fwd | cuDNN fwd | Splash fwd+bwd | cuDNN fwd+bwd |
-|---|---|---|---|---|
-| full, S=16K, D=128 | 866 | 1,571 | 695 | 1,317 |
-| full, S=16K, D=128, GQA 32/8 | 875 | 1,574 | 700 | 1,299 |
-| causal, S=16K, D=128 | 840 | 1,398 | 632 | 1,317 |
-| full, S=4K, D=128, GQA 32/8 | 892 | 1,396 | 636 | 1,239 |
-| full, S=16K, D=64 | 628 | 999 | 435 | 919 |
-| causal, S=16K, D=64 | 556 | 946 | 381 | 890 |
-| local (1K window), S=16K, D=128 | 609 | — | 480 | — |
-| chunked-causal (2K), S=16K, D=128 | 550 | — | 461 | — |
+| Mask | S | D | heads (q/kv) | Splash fwd | cuDNN fwd | Splash fwd+bwd | cuDNN fwd+bwd |
+|---|---|---|---|---|---|---|---|
+| causal | 16384 | 128 | 16/16 | 960 | 1398 (69%) | 875 | 1317 (66%) |
+| causal | 16384 | 128 | 32/8 | 976 | 1461 (67%) | 900 | 1291 (70%) |
+| causal | 16384 | 64 | 16/16 | 545 | 946 (58%) | 425 | 890 (48%) |
+| causal | 16384 | 64 | 32/8 | 552 | 964 (57%) | 432 | 887 (49%) |
+| causal | 4096 | 128 | 16/16 | 773 | 922 (84%) | 735 | 975 (75%) |
+| causal | 4096 | 128 | 32/8 | 807 | 1130 (71%) | 759 | 1016 (75%) |
+| causal | 4096 | 64 | 16/16 | 455 | 696 (65%) | 360 | 679 (53%) |
+| causal | 4096 | 64 | 32/8 | 481 | 734 (65%) | 375 | 702 (53%) |
+| chunked2k | 16384 | 128 | 16/16 | 643 | — | 525 | — |
+| chunked2k | 16384 | 128 | 32/8 | 672 | — | 643 | — |
+| chunked2k | 16384 | 64 | 16/16 | 264 | — | 260 | — |
+| chunked2k | 16384 | 64 | 32/8 | 266 | — | 274 | — |
+| chunked2k | 4096 | 128 | 16/16 | 589 | — | 560 | — |
+| chunked2k | 4096 | 128 | 32/8 | 616 | — | 632 | — |
+| chunked2k | 4096 | 64 | 16/16 | 255 | — | 243 | — |
+| chunked2k | 4096 | 64 | 32/8 | 266 | — | 269 | — |
+| full | 16384 | 128 | 16/16 | 1080 | 1571 (69%) | 891 | 1317 (68%) |
+| full | 16384 | 128 | 32/8 | 1084 | 1574 (69%) | 911 | 1299 (70%) |
+| full | 16384 | 64 | 16/16 | 620 | 999 (62%) | 487 | 919 (53%) |
+| full | 16384 | 64 | 32/8 | 624 | 1008 (62%) | 489 | 903 (54%) |
+| full | 4096 | 128 | 16/16 | 823 | 1319 (62%) | 736 | 1141 (64%) |
+| full | 4096 | 128 | 32/8 | 879 | 1396 (63%) | 756 | 1239 (61%) |
+| full | 4096 | 64 | 16/16 | 495 | 753 (66%) | 399 | 730 (55%) |
+| full | 4096 | 64 | 32/8 | 539 | 799 (68%) | 430 | 800 (54%) |
+| local1k | 16384 | 128 | 16/16 | 606 | — | 617 | — |
+| local1k | 16384 | 128 | 32/8 | 618 | — | 667 | — |
+| local1k | 16384 | 64 | 16/16 | 413 | — | 261 | — |
+| local1k | 16384 | 64 | 32/8 | 436 | — | 278 | — |
+| local1k | 4096 | 128 | 16/16 | 540 | — | 535 | — |
+| local1k | 4096 | 128 | 32/8 | 582 | — | 561 | — |
+| local1k | 4096 | 64 | 16/16 | 350 | — | 238 | — |
+| local1k | 4096 | 64 | 32/8 | 389 | — | 244 | — |
 
 For causal masks, the 128×128 accounting counts whole diagonal blocks, which
 is 0.8% more FLOPs than cuDNN's S²/2 at 16K.
