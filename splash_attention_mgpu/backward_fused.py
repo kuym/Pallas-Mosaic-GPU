@@ -38,9 +38,8 @@ from .backward import (
     _check_budgets,
     _launch,
     _num_elementwise_wgs,
-    _probs_and_dlogits,
 )
-from .kernel import SMEM_BYTES, SegmentIds, _swizzle_transforms, _where
+from .kernel import LOG2E, SMEM_BYTES, SegmentIds, _swizzle_transforms, _where
 
 
 def fused_supported(head_dim, head_dim_v, block_kv=128):
@@ -101,6 +100,8 @@ def splash_attention_bwd_fused(
   # of step t may still read dS^T while the elementwise warpgroups write the
   # next one, so dS^T is double-buffered in SMEM.
   early_scores = os.environ.get("SPLASH_BWD_EARLY_S", "1") == "1"
+  # Signal P^T separately from dS^T so the dV MMA overlaps the dS^T math.
+  split_p = os.environ.get("SPLASH_BWD_SPLIT_P", "1") == "1"
   ds_bufs = 2 if early_scores else 1
   _check_budgets(
       "fused backward kernel",
@@ -135,7 +136,7 @@ def splash_attention_bwd_fused(
         sp_union, dd_union, dk_tmem, dv_tmem, dqt_tmem,
         kv_barrier, q_barriers, mask_barriers,
         consumed, aux_consumed, s_ready, p_ready, done, mma_order, loaded,
-        dq_ready, dq_free, dq_load_barrier,
+        dq_ready, dq_free, dq_load_barrier, ds_ready,
     ) = refs
     st_tmem, pt_tmem = sp_union
     dpt_tmem, dst_tmem = dd_union
@@ -259,6 +260,9 @@ def splash_attention_bwd_fused(
               plgpu.barrier_wait(p_ready)
             plgpu.tcgen05_mma(dv_tmem, pt_tmem, do_smem.at[slot],
                               accumulate=t > 0)
+            if split_p:
+              with jax.named_scope("mma_wait_ds"):
+                plgpu.barrier_wait(ds_ready)
             plgpu.tcgen05_mma(dk_tmem, dst_tmem, q_smem.at[slot],
                               accumulate=t > 0)
             if serialize_mma:
@@ -347,14 +351,27 @@ def splash_attention_bwd_fused(
           # land where this one reads, so all loads precede any store.
           plgpu.barrier_arrive(loaded)
           plgpu.barrier_wait(loaded)
+        bcast = lambda x: lax.broadcast_in_dim(x, logits_t.shape, [1])
         with jax.named_scope("ew_math"):
-          p_t, ds_t = _probs_and_dlogits(
-              logits_t, dp_t, lse_c, delta_c, masks=masks,
-              soft_cap=attn_logits_soft_cap, mask_value=mask_value,
-              lse_dims=[1])
+          if attn_logits_soft_cap is not None:
+            tcap = jnp.tanh(logits_t / attn_logits_soft_cap)
+            logits_t = tcap * attn_logits_soft_cap
+          logits_t = masks(logits_t)
+          p_t = jnp.exp2((logits_t - bcast(lse_c)) * LOG2E)
+        if split_p:
+          # P^T first: the dV MMA (which needs only P^T) overlaps dS^T.
+          with jax.named_scope("ew_store_p"):
+            plgpu.async_store_tmem(pt_tmem.at[:, cols], p_t.astype(dtype))
+            plgpu.commit_tmem()
+            plgpu.barrier_arrive(p_ready)
+        with jax.named_scope("ew_math_ds"):
+          ds_t = p_t * (dp_t - bcast(delta_c))
+          if attn_logits_soft_cap is not None:
+            ds_t = ds_t * (1.0 - tcap * tcap)
         with jax.named_scope("ew_store"):
           ds16 = ds_t.astype(dtype)
-          plgpu.async_store_tmem(pt_tmem.at[:, cols], p_t.astype(dtype))
+          if not split_p:
+            plgpu.async_store_tmem(pt_tmem.at[:, cols], p_t.astype(dtype))
           plgpu.async_store_tmem(dst_tmem.at[:, cols], ds16)
           ds_buf = ds_smem.at[lax.rem(t, ds_bufs)]
           if dq_transposed:
@@ -364,7 +381,7 @@ def splash_attention_bwd_fused(
           plgpu.commit_tmem()
           plgpu.commit_smem()  # dS^T for the async proxy; fences our reads
         plgpu.barrier_arrive(aux_consumed.at[slot])
-        plgpu.barrier_arrive(p_ready)
+        plgpu.barrier_arrive(ds_ready if split_p else p_ready)
 
       for_each_step(step)
 
@@ -463,6 +480,8 @@ def splash_attention_bwd_fused(
       plgpu.Barrier(orders_tensor_core=True),
       plgpu.Barrier(orders_tensor_core=True),
       None,
+      plgpu.Barrier(num_arrivals=ne, orders_tensor_core=True)
+      if split_p else None,
   ]
   inputs = [q, k, v, do, lse, delta]
   if has_segments:
