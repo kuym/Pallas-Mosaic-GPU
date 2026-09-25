@@ -81,8 +81,8 @@ class BlockSizes:
   """
 
   block_q: int | None = None  # None: choose 128 or 256 per call (see below)
-  block_kv: int = 128
-  num_stages: int = 2
+  block_kv: int | None = None  # None: 64 for head_dim 64 (block_q 128), else 128
+  num_stages: int | None = None  # None: 3 with block_kv 64 at head_dim 64, else 2
   block_kv_dq: int | None = None
   block_q_dkv: int | None = None
   num_stages_bwd: int = 2
@@ -92,10 +92,10 @@ class BlockSizes:
       # 256 selects the two-tile ping-pong forward kernel; None picks it
       # automatically where it is faster (head_dim 128, little extra work).
       raise ValueError(f"block_q must be None, 128 or 256, got {self.block_q}")
-    if self.block_kv not in (64, 128):
+    if self.block_kv not in (None, 64, 128):
       # Two f32 S buffers of 256 columns would fill all of TMEM.
       raise ValueError(f"block_kv must be 64 or 128, got {self.block_kv}")
-    if self.num_stages < 2:
+    if self.num_stages is not None and self.num_stages < 2:
       # QK of step s+1 is issued before PV of step s, so the K/V ring must
       # hold two steps or the pipeline deadlocks.
       raise ValueError(f"num_stages must be >= 2, got {self.num_stages}")

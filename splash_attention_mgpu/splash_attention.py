@@ -36,33 +36,45 @@ from .kernel import DEFAULT_MASK_VALUE, BlockSizes, SegmentIds
 AUTO_PINGPONG_MAX_EXTRA_WORK = 1.10
 
 
+def auto_forward_tiles(head_dim: int, block_q: int) -> tuple[int, int]:
+  """(block_kv, num_stages) that were best on average in the B200 sweep."""
+  if head_dim <= 64 and block_q == 128:
+    return 64, 3  # 0.96 of the per-problem best vs 0.84 for (128, 2)
+  return 128, 2
+
+
 class SplashAttentionKernel:
   """Callable holding the processed mask.
 
   Differentiable with respect to q, k and v (dQ and dK/dV Mosaic GPU kernels,
   as in the TPU module).  With `save_residuals=True` the logsumexp is also
   returned, and that variant is forward-only.
+
+  `None` fields of `block_sizes` are chosen per call (from the head dims,
+  the mask and the budgets); forward schedules are built lazily per tiling.
   """
 
   def __init__(
       self,
-      info: mask_info_lib.GpuMaskInfo,
+      mask: mask_lib.MultiHeadMask,
       *,
-      fwd_infos: dict[int, mask_info_lib.GpuMaskInfo],
       is_mqa: bool,
       block_sizes: BlockSizes,
       mask_value: float,
       attn_logits_soft_cap: float | None,
       interpret: Any,
   ):
-    # `info` has 128x128 granularity (backward kernels, FLOP accounting);
-    # `fwd_infos[block_q]` is the forward schedule for each candidate block_q.
-    self.info = info
-    self.fwd_infos = fwd_infos
+    self.mask = mask
     self.is_mqa = is_mqa
     self.requested_block_sizes = block_sizes
+    self.mask_value = mask_value
+    self.attn_logits_soft_cap = attn_logits_soft_cap
+    self.interpret = interpret
+    # 128x128 schedule: backward kernels and FLOP accounting.
+    self.info = self.fwd_info(128, 128)
     to_dev = lambda x: None if x is None else jnp.asarray(x)
-    bwd = dict(
+    info = self.info
+    self._bwd = dict(
         num_steps=to_dev(info.num_steps),
         q_block_order=to_dev(info.q_block_order),
         kv_block=to_dev(info.kv_block),
@@ -77,13 +89,60 @@ class SplashAttentionKernel:
         partial_mask_blocks_t=to_dev(info.partial_mask_blocks_t),
     )
     self._variants = {}
-    for bq, fwd in fwd_infos.items():
+
+  @functools.lru_cache(maxsize=None)
+  def fwd_info(self, block_q: int, block_kv: int) -> mask_info_lib.GpuMaskInfo:
+    return mask_info_lib.process_mask(self.mask, (block_q, block_kv))
+
+  @property
+  def pingpong_extra_work(self) -> float | None:
+    """Extra KV-block work of the 256-row schedule vs. the 128-row one."""
+    if self.mask.shape[1] % 256:
+      return None
+    return (float(self.fwd_info(256, 128).num_steps.sum()) * 256
+            / max(1.0, float(self.fwd_info(128, 128).num_steps.sum()) * 128))
+
+  def choose_block_q(self, head_dim: int, head_dim_v: int, *,
+                     itemsize: int = 2, has_segments: bool = False,
+                     save_residuals: bool = True) -> int:
+    bs = self.requested_block_sizes
+    if bs.block_q is not None:
+      return bs.block_q
+    extra = self.pingpong_extra_work
+    if head_dim != head_dim_v or head_dim != 128 or extra is None:
+      return 128
+    if extra > AUTO_PINGPONG_MAX_EXTRA_WORK:
+      return 128
+    bkv, stages = self._tiles(head_dim, 256)
+    fits = forward_pingpong.pingpong_fits(
+        head_dim=head_dim, block_kv=bkv, num_stages=stages,
+        itemsize=itemsize,
+        has_dense_mask=self.fwd_info(256, bkv).partial_mask_blocks is not None,
+        has_segments=has_segments, save_residuals=save_residuals)
+    return 256 if fits else 128
+
+  def _tiles(self, head_dim: int, block_q: int) -> tuple[int, int]:
+    bs = self.requested_block_sizes
+    auto_kv, auto_stages = auto_forward_tiles(head_dim, block_q)
+    return (bs.block_kv or auto_kv, bs.num_stages or auto_stages)
+
+  def resolved_block_sizes(self, head_dim: int, head_dim_v: int, **kw):
+    bq = self.choose_block_q(head_dim, head_dim_v, **kw)
+    bkv, stages = self._tiles(head_dim, bq)
+    return dataclasses.replace(self.requested_block_sizes, block_q=bq,
+                               block_kv=bkv, num_stages=stages)
+
+  def _variant(self, bs: BlockSizes):
+    key = (bs.block_q, bs.block_kv, bs.num_stages)
+    if key not in self._variants:
+      fwd = self.fwd_info(bs.block_q, bs.block_kv)
+      to_dev = lambda x: None if x is None else jnp.asarray(x)
       static = _Static(
-          mask_function=info.mask_function,
-          block_sizes=dataclasses.replace(block_sizes, block_q=bq),
-          mask_value=mask_value,
-          attn_logits_soft_cap=attn_logits_soft_cap,
-          interpret=interpret,
+          mask_function=self.info.mask_function,
+          block_sizes=bs,
+          mask_value=self.mask_value,
+          attn_logits_soft_cap=self.attn_logits_soft_cap,
+          interpret=self.interpret,
       )
       schedule = _Schedule(
           fwd_num_steps=to_dev(fwd.num_steps),
@@ -92,33 +151,10 @@ class SplashAttentionKernel:
           fwd_block_kind=to_dev(fwd.block_kind),
           fwd_mask_block=to_dev(fwd.mask_block),
           fwd_partial_mask_blocks=to_dev(fwd.partial_mask_blocks),
-          **bwd,
+          **self._bwd,
       )
-      self._variants[bq] = (static, schedule)
-    # Extra KV-block work of the 256-row schedule relative to the 128-row one.
-    self.pingpong_extra_work = None
-    if 256 in fwd_infos and 128 in fwd_infos:
-      self.pingpong_extra_work = (
-          float(fwd_infos[256].num_steps.sum()) * 256
-          / max(1.0, float(fwd_infos[128].num_steps.sum()) * 128))
-
-  def choose_block_q(self, head_dim: int, head_dim_v: int, *,
-                     itemsize: int = 2, has_segments: bool = False,
-                     save_residuals: bool = True) -> int:
-    requested = self.requested_block_sizes.block_q
-    if requested is not None:
-      return requested
-    bs = self.requested_block_sizes
-    if (256 in self._variants and head_dim == head_dim_v == 128
-        and self.pingpong_extra_work is not None
-        and self.pingpong_extra_work <= AUTO_PINGPONG_MAX_EXTRA_WORK
-        and forward_pingpong.pingpong_fits(
-            head_dim=head_dim, block_kv=bs.block_kv,
-            num_stages=bs.num_stages, itemsize=itemsize,
-            has_dense_mask=self.fwd_infos[256].partial_mask_blocks is not None,
-            has_segments=has_segments, save_residuals=save_residuals)):
-      return 256
-    return 128
+      self._variants[key] = (static, schedule)
+    return self._variants[key]
 
   @property
   def block_sizes(self) -> BlockSizes:
@@ -133,9 +169,10 @@ class SplashAttentionKernel:
       *,
       save_residuals: bool = False,
   ):
-    static, schedule = self._variants[self.choose_block_q(
+    bs = self.resolved_block_sizes(
         q.shape[-1], v.shape[-1], itemsize=jnp.dtype(q.dtype).itemsize,
-        has_segments=segment_ids is not None)]
+        has_segments=segment_ids is not None)
+    static, schedule = self._variant(bs)
     return _splash_attention(
         q, k, v, segment_ids, schedule,
         is_mqa=self.is_mqa, static=static, save_residuals=save_residuals,
@@ -293,23 +330,8 @@ def _make_splash_attention(
     mask = mask_lib.MultiHeadMask(
         [mask_lib.NumpyMask(m) for m in mask]
     )
-  # The backward kernels (and FLOP accounting) always use a 128x128 schedule;
-  # the forward kernel uses (block_q, block_kv) for each candidate block_q.
-  info = mask_info_lib.process_mask(mask, (128, 128))
-  q_len = mask.shape[1]
-  if block_sizes.block_q is not None:
-    candidates = [block_sizes.block_q]
-  else:
-    candidates = [128] + ([256] if q_len % 256 == 0 else [])
-  fwd_infos = {}
-  for bq in candidates:
-    if (bq, block_sizes.block_kv) == (128, 128):
-      fwd_infos[bq] = info
-    else:
-      fwd_infos[bq] = mask_info_lib.process_mask(mask, (bq, block_sizes.block_kv))
   return SplashAttentionKernel(
-      info,
-      fwd_infos=fwd_infos,
+      mask,
       is_mqa=is_mqa,
       block_sizes=block_sizes,
       mask_value=mask_value,

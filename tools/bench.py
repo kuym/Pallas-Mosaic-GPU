@@ -67,8 +67,9 @@ def measure(config: dict) -> dict:
   k = jax.random.normal(ks[1], lead + (kv_heads, seq, d), jnp.bfloat16)
   v = jax.random.normal(ks[2], lead + (kv_heads, seq, d), jnp.bfloat16)
 
+  used = kernel.resolved_block_sizes(d, d)  # auto (None) fields resolved
   record = dict(cfg, block_sizes=dict(
-      (key, getattr(bs, key)) for key in BLOCK_SIZE_KEYS))
+      (key, getattr(used, key)) for key in BLOCK_SIZE_KEYS))
   t0 = time.time()
   out = jax.block_until_ready(kernel(q, k, v))
   record["compile_s"] = round(time.time() - t0, 2)
