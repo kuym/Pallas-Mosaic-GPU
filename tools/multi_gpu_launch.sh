@@ -40,7 +40,7 @@ fi
 
 for i in $(seq 0 $((ngpu - 1))); do
   python tools/gpu_farm.py submit --root farm --priority 0 --name "tests$i/$ngpu" \
-      -- env FARM_SHARD="$i/$ngpu" python -m pytest tests -q -p no:cacheprovider \
+      -- env FARM_SHARD="$i/$ngpu" timeout 1800 python -m pytest tests -q -p no:cacheprovider \
          -rs -k "gpu_" >/dev/null
 done
 python tools/sweep.py --root farm --priority 20

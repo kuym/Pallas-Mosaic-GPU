@@ -68,7 +68,8 @@ def main():
         os.path.join(args.root, "sweeps", f"{args.tag}{n:04d}.json"))
     with open(path, "w") as f:
       json.dump(chunk, f)
-    cmd = f"python tools/bench.py --configs @{shlex.quote(path)}"
+    # A hard timeout: a hung kernel must never hold a GPU hostage.
+    cmd = f"timeout 1200 python tools/bench.py --configs @{shlex.quote(path)}"
     gpu_farm.submit(args.root, cmd, args.priority, f"{args.tag}{n:04d}")
 
 
