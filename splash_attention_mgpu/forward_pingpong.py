@@ -207,6 +207,9 @@ def splash_attention_forward_pingpong(
   else:
     w = bkv // softmax_parts
     parts = [(i * w, w) for i in range(softmax_parts)]
+  fast_full_blocks = (len(parts) == 1 and not exp_emulation_cols
+                      and not ablate and not has_segments
+                      and os.environ.get("SPLASH_FAST_FULL", "1") == "1")
   if num_steps.shape[1] != q_seq_len // CTA_ROWS:
     raise ValueError("mask info must be built with block_q=256")
 
@@ -416,20 +419,54 @@ def splash_attention_forward_pingpong(
           qks = [plgpu.async_load_tmem(s_tmems[t].at[:, pl.ds(c0, nc)])
                  for c0, nc in parts]
           plgpu.wait_load_tmem()
-        with jax.named_scope("sm_mask"):
-          if attn_logits_soft_cap is not None:
-            qks = [jnp.tanh(x / attn_logits_soft_cap) * attn_logits_soft_cap
-                   for x in qks]
-          qks = [apply_masks(x * LOG2E, s, slot, kv_blk, c0, nc, i == 0)
-                 for i, (x, (c0, nc)) in enumerate(zip(qks, parts))]
+        if attn_logits_soft_cap is not None:
+          qks = [jnp.tanh(x / attn_logits_soft_cap) * attn_logits_soft_cap
+                 for x in qks]
+
+        def online_max(row_maxes):
+          m_curr = _tree(jnp.maximum, [m_prev] + row_maxes)
+          needs_rescale = m_curr - m_prev > RESCALE_THRESHOLD
+          m_next = _where(needs_rescale, m_curr, m_prev)
+          return m_next, jnp.exp2(m_prev - m_next)
+
+        if fast_full_blocks:
+          # Blocks that need no masking (FULL blocks without segment ids, the
+          # vast majority) take a short path: the log2e scaling is folded
+          # into exp2's argument (one FMA per element), and the row max is
+          # taken on the raw logits.  Partial blocks keep the masked path,
+          # whose semantics (mask_value in log2 units) are unchanged.
+          [qk] = qks
+          is_partial = block_kind_gmem[mh, qi, s] == mask_info_lib.PARTIAL
+
+          def full_block():
+            m_next, alpha = online_max([qk.max(axis=1) * LOG2E])
+            p = jnp.exp2(qk * LOG2E - lax.broadcast_in_dim(m_next, qk.shape, [0]))
+            return p, m_next, alpha
+
+          def partial_block():
+            x = apply_masks(qk * LOG2E, s, slot, kv_blk, 0, bkv, True)
+            m_next, alpha = online_max([x.max(axis=1)])
+            p = jnp.exp2(x - lax.broadcast_in_dim(m_next, x.shape, [0]))
+            return p, m_next, alpha
+
+          with jax.named_scope("sm_exp"):
+            if has_dense_mask or mask_function is not None:
+              p, m_next, alpha = lax.cond(is_partial, partial_block, full_block)
+            else:
+              p, m_next, alpha = full_block()
           if has_aux:
             plgpu.commit_smem()  # Fence generic reads before TMA overwrites.
             plgpu.barrier_arrive(aux_consumed.at[slot])
+        else:
+          with jax.named_scope("sm_mask"):
+            qks = [apply_masks(x * LOG2E, s, slot, kv_blk, c0, nc, i == 0)
+                   for i, (x, (c0, nc)) in enumerate(zip(qks, parts))]
+            if has_aux:
+              plgpu.commit_smem()  # Fence generic reads before TMA overwrites.
+              plgpu.barrier_arrive(aux_consumed.at[slot])
+          with jax.named_scope("sm_exp"):
+            m_next, alpha = online_max([x.max(axis=1) for x in qks])
         with jax.named_scope("sm_exp"):
-          m_curr = _tree(jnp.maximum, [m_prev] + [x.max(axis=1) for x in qks])
-          needs_rescale = m_curr - m_prev > RESCALE_THRESHOLD
-          m_next = _where(needs_rescale, m_curr, m_prev)
-          alpha = jnp.exp2(m_prev - m_next)
           if correction:
             @pl.when(s > 0)
             def _publish_alpha():
@@ -438,8 +475,8 @@ def splash_attention_forward_pingpong(
                 plgpu.barrier_wait(alpha_consumed.at[t])
               alpha_smem[t] = alpha
               plgpu.barrier_arrive(alpha_ready.at[t])
-          ps = []
-          for i, x in enumerate(qks):
+          ps = [p] if fast_full_blocks else []
+          for i, x in enumerate([] if fast_full_blocks else qks):
             if ablate == "nosoftmax":  # perf experiment only: wrong results
               ps.append(x)
               continue
