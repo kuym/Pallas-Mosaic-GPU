@@ -296,7 +296,11 @@ def _attention_bwd(static, residuals, do):
       attn_logits_soft_cap=static.attn_logits_soft_cap,
       interpret=static.interpret,
   )
-  if (backward_fused.fused_supported(q.shape[-1], v.shape[-1])
+  # Fused backward: default for head_dim 128 (+6-30% on B200). At head_dim 64
+  # it is correct but slower than the split kernels (-10-30%), so opt-in.
+  use_fused = q.shape[-1] == 128 or os.environ.get("SPLASH_BWD_FUSED_D64") == "1"
+  if (use_fused
+      and backward_fused.fused_supported(q.shape[-1], v.shape[-1])
       and backward_fused.fused_fits(
           head_dim=q.shape[-1], num_stages=bs.num_stages_bwd,
           itemsize=jnp.dtype(q.dtype).itemsize,

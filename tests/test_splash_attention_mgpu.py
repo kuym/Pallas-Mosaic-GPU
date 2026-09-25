@@ -599,8 +599,14 @@ GRAD_CASES_D64_FUSED = [
 ]
 
 
+@pytest.fixture
+def fused_d64(monkeypatch):
+  # The fused backward is opt-in at head_dim 64 (slower there on B200).
+  monkeypatch.setenv("SPLASH_BWD_FUSED_D64", "1")
+
+
 @pytest.mark.parametrize("kwargs", GRAD_CASES_D64_FUSED, ids=_case_id)
-def test_interpret_grads_fused_d64(kwargs):
+def test_interpret_grads_fused_d64(kwargs, fused_d64):
   # head_dim 64 uses the fused backward's dQ = dS K formulation.
   kwargs = dict(kwargs)
   _check_grads(kwargs.pop("mask_name"), interpret=INTERPRET, **kwargs)
@@ -608,6 +614,6 @@ def test_interpret_grads_fused_d64(kwargs):
 
 @needs_blackwell
 @pytest.mark.parametrize("kwargs", GRAD_CASES_D64_FUSED, ids=_case_id)
-def test_gpu_grads_fused_d64(kwargs):
+def test_gpu_grads_fused_d64(kwargs, fused_d64):
   kwargs = dict(kwargs)
   _check_grads(kwargs.pop("mask_name"), s=2048, **kwargs)

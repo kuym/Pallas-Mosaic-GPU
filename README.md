@@ -229,6 +229,7 @@ noted:
 | Backward: two elementwise warpgroups (column split; `loaded` barrier for packed-P aliasing) | +0–2% alone |
 | Backward: 128-wide sub-blocks (fits TMEM once Pᵀ/dSᵀ alias Sᵀ/dPᵀ) | with 2 WGs: +7–15% fwd+bwd. Profile: per-step MMA↔elementwise handoff latency dominated at 64-wide steps |
 | **Fused backward** (one kernel, 5 MMAs, dQ via TMA reduce-add) | **+6% (full) to +30% (local/chunked)** fwd+bwd at D=128 |
+| Fused backward at D=64 (128-row steps, dQ = dS·K via transposed-SMEM A) | correct, but −10 to −30% vs the split kernels. Opt-in (`SPLASH_BWD_FUSED_D64=1`) |
 
 Ablations, with deliberately wrong results, show where the time goes. At full
 S=16K D=128 the kernel does 1,087 TFLOP/s. Without the O rescale it does 1,217.
