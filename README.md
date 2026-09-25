@@ -204,6 +204,8 @@ noted:
 | Correction warpgroup that rescales O off the softmax path | +3% (full D=128), −3 to −16% elsewhere. Off by default |
 | Unmasked-block fast path (log2e folded into the exp2 FMA) | −1% to +5% (D=64). On by default |
 | Scheduling token so the two tiles' softmax phases alternate | +2% (full), −3 to −20% elsewhere. Off by default |
+| Double-buffered Sᵀ/dPᵀ in the dK/dV kernel (overlap MMAs with elementwise work) | −8% (full D=128) to +3% (short/masked). Off by default (`SPLASH_BWD_DOUBLE_BUFFER=1`) |
+| Automatic `block_q` (ping-pong for D=128 when the 256-row schedule adds ≤10% work) | the best kernel per problem by default |
 
 Ablations, with deliberately wrong results, show where the time goes. At full
 S=16K D=128 the kernel does 1,087 TFLOP/s. Without the O rescale it does 1,217.

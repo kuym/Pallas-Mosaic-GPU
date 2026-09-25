@@ -386,7 +386,7 @@ def splash_attention_bwd_dkv(
   # step t+1 overlap the elementwise work of step t.  Needs a second SMEM
   # stage (the prefetched step's Q/dO) and 4 * bc + dk + dv TMEM columns.
   nbuf = 2 if (num_stages >= 2 and 4 * bc + head_dim + head_dim_v <= TMEM_COLS
-               and os.environ.get("SPLASH_BWD_DOUBLE_BUFFER", "1") == "1") else 1
+               and os.environ.get("SPLASH_BWD_DOUBLE_BUFFER", "0") == "1") else 1
   serialize_mma = interpret is not None  # P^T aliases S^T in both modes
   _check_budgets(
       "dKV kernel",
