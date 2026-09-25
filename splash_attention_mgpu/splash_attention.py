@@ -210,7 +210,7 @@ def _attention_bwd(static, residuals, do):
   do = do.astype(q.dtype)
   common = dict(
       mask_function=static.mask_function,
-      block_kv=bs.block_kv,
+      block_kv=128,  # the backward schedule is always 128x128
       num_stages=bs.num_stages_bwd,
       mask_value=static.mask_value,
       attn_logits_soft_cap=static.attn_logits_soft_cap,
@@ -252,9 +252,11 @@ def _make_splash_attention(
     mask = mask_lib.MultiHeadMask(
         [mask_lib.NumpyMask(m) for m in mask]
     )
-  info = mask_info_lib.process_mask(mask, (128, block_sizes.block_kv))
+  # The backward kernels (and FLOP accounting) always use a 128x128 schedule;
+  # the forward kernel uses (block_q, block_kv).
+  info = mask_info_lib.process_mask(mask, (128, 128))
   fwd_info = None
-  if block_sizes.block_q != 128:
+  if (block_sizes.block_q, block_sizes.block_kv) != (128, 128):
     fwd_info = mask_info_lib.process_mask(
         mask, (block_sizes.block_q, block_sizes.block_kv))
   return SplashAttentionKernel(

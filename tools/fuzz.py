@@ -34,7 +34,7 @@ def draw(seed):
   seq = r.choice([256, 512, 1024, 2048, 3072])
   head_dim = r.choice([64, 128, 128])
   grad = r.random() < 0.6
-  block_kv = r.choice([64, 128]) if not grad else 128
+  block_kv = r.choice([64, 128])
   heads = r.choice([1, 2, 3, 4, 8])
   kv_heads = r.choice([h for h in (1, 2, heads) if heads % h == 0])
   case = dict(
@@ -50,14 +50,11 @@ def draw(seed):
           block_q_dkv=64 if head_dim == 128 else r.choice([64, 128]),
           num_stages_bwd=r.choice([1, 2, 3])),
   )
-  if case["block_sizes"]["block_kv_dq"] > block_kv:
-    case["block_sizes"]["block_kv_dq"] = block_kv
   # Half the cases exercise the two-tile ping-pong forward kernel.
   if seq % 256 == 0 and r.random() < 0.5:
     case["block_sizes"]["block_q"] = 256
     if case["mask"] == "dense" or case["per_head_masks"]:
       case["block_sizes"]["block_kv"] = 64  # SMEM for 256-row mask blocks
-      case["block_sizes"]["block_kv_dq"] = 64
   return case
 
 

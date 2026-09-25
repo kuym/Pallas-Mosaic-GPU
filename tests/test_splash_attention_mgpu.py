@@ -511,3 +511,11 @@ def test_gpu_pingpong_grads(kwargs):
   kwargs = dict(kwargs)
   kwargs.setdefault("block_sizes", PINGPONG)
   _check_grads(kwargs.pop("mask_name"), s=2048, **kwargs)
+
+
+@pytest.mark.parametrize("block_sizes", [sa.BlockSizes(block_kv=64),
+                                         sa.BlockSizes(block_q=256, block_kv=64)],
+                         ids=["bkv64", "pingpong-bkv64"])
+def test_interpret_grads_independent_of_forward_tiling(block_sizes):
+  # Found by the B200 fuzzer: gradients used to require block_kv == 128.
+  _check_grads("dense", interpret=INTERPRET, block_sizes=block_sizes)
