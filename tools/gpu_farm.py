@@ -194,6 +194,27 @@ def status(root):
     print(f"  queued {n[:-5]}")
 
 
+def wait(root, pattern, timeout=3600, poll=5.0):
+  """Blocks until no queued/running job name contains `pattern` and at least
+  one such job is done; prints the matching jobs' exit codes."""
+  import fnmatch
+  d = _dirs(root)
+  deadline = time.time() + timeout
+  match = lambda n: fnmatch.fnmatch(n, f"*{pattern}*")
+  while time.time() < deadline:
+    pending = [n for sub in ("queue", "running") for n in os.listdir(d[sub])
+               if n.endswith(".json") and match(n)]
+    done = [n for n in os.listdir(d["done"]) if match(n)]
+    if not pending and done:
+      for n in sorted(done):
+        j = json.load(open(os.path.join(d["done"], n)))
+        print(f"{j['name']}: rc={j['rc']} ({j['seconds']}s)")
+      return 0
+    time.sleep(poll)
+  print(f"timeout waiting for {pattern}")
+  return 1
+
+
 def main():
   p = argparse.ArgumentParser()
   sub = p.add_subparsers(dest="cmd", required=True)
@@ -209,6 +230,10 @@ def main():
   s.add_argument("command", nargs=argparse.REMAINDER)
   s = sub.add_parser("status")
   s.add_argument("--root", default="farm")
+  s = sub.add_parser("wait")
+  s.add_argument("--root", default="farm")
+  s.add_argument("--timeout", type=float, default=3600)
+  s.add_argument("pattern")
   args = p.parse_args()
   if args.cmd == "serve":
     serve(args.root, _gpus(args.gpus), args.filler, results=args.results)
@@ -217,6 +242,8 @@ def main():
     if not cmd:
       sys.exit("submit: missing command")
     print(submit(args.root, shlex.join(cmd), args.priority, args.name))
+  elif args.cmd == "wait":
+    sys.exit(wait(args.root, args.pattern, args.timeout))
   else:
     status(args.root)
 
