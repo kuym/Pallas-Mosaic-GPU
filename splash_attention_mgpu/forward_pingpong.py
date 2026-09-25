@@ -29,6 +29,7 @@ other; rows whose first visited block is fully masked are corrected by the
 from __future__ import annotations
 
 import functools
+import os
 from typing import Any
 
 import jax
@@ -68,8 +69,8 @@ def splash_attention_forward_pingpong(
     mask_value: float,
     attn_logits_soft_cap: float | None,
     save_residuals: bool,
-    softmax_registers: int = 240,
-    producer_registers: int = 32,
+    softmax_registers: int | None = None,
+    producer_registers: int | None = None,
     interpret: Any = None,
 ):
   batch, num_q_heads, q_seq_len, head_dim = q.shape
@@ -102,6 +103,14 @@ def splash_attention_forward_pingpong(
   if smem_bytes > SMEM_BYTES:
     raise ValueError(f"Shared memory budget exceeded ({smem_bytes} > "
                      f"{SMEM_BYTES} bytes); reduce num_stages or block_kv")
+  # setmaxnreg: 2 x 128 x 232 + 128 x 40 = 64512 of the SM's 65536 registers
+  # (the same split as JAX's Hopper attention kernel).  SPLASH_PP_REGS="a,b"
+  # overrides it for experiments; "0,0" disables register reallocation.
+  env_regs = os.environ.get("SPLASH_PP_REGS")
+  if env_regs:
+    softmax_registers, producer_registers = map(int, env_regs.split(","))
+  softmax_registers = 232 if softmax_registers is None else softmax_registers
+  producer_registers = 40 if producer_registers is None else producer_registers
   q_heads_per_kv_head = num_q_heads // num_kv_heads
   mask_heads = num_steps.shape[0]
   serialize_pv = interpret is not None
@@ -142,7 +151,8 @@ def splash_attention_forward_pingpong(
 
     @pl.when(wg == NUM_TILES)
     def _producer_wg():
-      plgpu.set_max_registers(producer_registers, action="decrease")
+      if producer_registers:
+        plgpu.set_max_registers(producer_registers, action="decrease")
 
       @plgpu.warp_map
       def _per_warp(warp_id):
@@ -246,7 +256,8 @@ def splash_attention_forward_pingpong(
                 plgpu.barrier_wait(pv_order.at[t])
 
     def softmax_wg(t):  # t: static tile index
-      plgpu.set_max_registers(softmax_registers, action="increase")
+      if softmax_registers:
+        plgpu.set_max_registers(softmax_registers, action="increase")
       rows = pl.ds(t * TILE, TILE)
       plgpu.barrier_wait(q_barrier)
       if has_segments:
